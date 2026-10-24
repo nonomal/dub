@@ -1,37 +1,35 @@
-import { parse } from "@/lib/middleware/utils";
+import { canAccessAdminPath } from "@/lib/auth/admin-access-guard";
+import { prismaEdge } from "@/lib/prisma/edge";
 import { DUB_WORKSPACE_ID } from "@dub/utils";
-import { getToken } from "next-auth/jwt";
 import { NextRequest, NextResponse } from "next/server";
-import { conn } from "../planetscale";
-import { UserProps } from "../types";
+import { getUserViaToken } from "./utils/get-user-via-token";
+import { parse } from "./utils/parse";
 
-export default async function AdminMiddleware(req: NextRequest) {
+export async function AdminMiddleware(req: NextRequest) {
   const { path } = parse(req);
-  let isAdmin = false;
 
-  const session = (await getToken({
-    req,
-    secret: process.env.NEXTAUTH_SECRET,
-  })) as {
-    id?: string;
-    email?: string;
-    user?: UserProps;
-  };
+  const user = await getUserViaToken(req);
 
-  const response = await conn
-    .execute("SELECT projectId FROM ProjectUsers WHERE userId = ?", [
-      session?.user?.id,
-    ])
-    .then((res) => res.rows[0] as { projectId: string } | undefined);
+  if (!user && path !== "/login") {
+    return NextResponse.redirect(new URL("/login", req.url));
+  } else if (user) {
+    const isAdminUser = await prismaEdge.projectUsers.findUnique({
+      where: {
+        userId_projectId: {
+          userId: user.id,
+          projectId: DUB_WORKSPACE_ID,
+        },
+      },
+    });
 
-  if (response?.projectId === DUB_WORKSPACE_ID) {
-    isAdmin = true;
-  }
-
-  if (path === "/login" && isAdmin) {
-    return NextResponse.redirect(new URL("/", req.url));
-  } else if (path !== "/login" && !isAdmin) {
-    return NextResponse.redirect(new URL(`/login`, req.url));
+    if (!isAdminUser) {
+      return NextResponse.next(); // throw 404 page
+    } else if (
+      path === "/login" ||
+      !canAccessAdminPath({ userId: user.id, pathname: path })
+    ) {
+      return NextResponse.redirect(new URL("/", req.url));
+    }
   }
 
   return NextResponse.rewrite(

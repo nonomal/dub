@@ -1,3 +1,5 @@
+import { createOAuthUrl } from "@/lib/actions/create-oauth-url";
+import useCurrentFolderId from "@/lib/swr/use-current-folder-id";
 import useWorkspace from "@/lib/swr/use-workspace";
 import { BitlyGroupProps } from "@/lib/types";
 import {
@@ -11,7 +13,8 @@ import {
 } from "@dub/ui";
 import { fetcher } from "@dub/utils";
 import { ArrowRight, ServerOff } from "lucide-react";
-import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { useAction } from "next-safe-action/hooks";
+import { useRouter } from "next/navigation";
 import {
   Dispatch,
   SetStateAction,
@@ -21,7 +24,8 @@ import {
   useState,
 } from "react";
 import { toast } from "sonner";
-import useSWR, { mutate } from "swr";
+import useSWRImmutable from "swr/immutable";
+import { useImportModalParam } from "./use-import-modal-param";
 
 function ImportBitlyModal({
   showImportBitlyModal,
@@ -31,22 +35,35 @@ function ImportBitlyModal({
   setShowImportBitlyModal: Dispatch<SetStateAction<boolean>>;
 }) {
   const router = useRouter();
-  const { slug } = useParams() as { slug?: string };
-  const searchParams = useSearchParams();
-  const { id } = useWorkspace();
+  const { folderId } = useCurrentFolderId();
+  const { id: workspaceId } = useWorkspace();
+  const [importing, setImporting] = useState(false);
+  const { queryParams } = useRouterStuff();
 
-  const [redirecting, setRedirecting] = useState(false);
+  const { executeAsync, isPending } = useAction(createOAuthUrl, {
+    onSuccess: ({ data }) => {
+      if (!data?.url) {
+        toast.error("Failed to generate OAuth URL.");
+        return;
+      }
 
-  const { data: groups, isLoading } = useSWR<BitlyGroupProps[]>(
-    id && showImportBitlyModal && `/api/workspaces/${id}/import/bitly`,
+      router.push(data.url);
+    },
+    onError: ({ error }) => {
+      toast.error(error.serverError || "Failed to generate OAuth URL.");
+    },
+  });
+
+  const {
+    data: groups,
+    isLoading,
+    mutate,
+  } = useSWRImmutable<BitlyGroupProps[]>(
+    workspaceId &&
+      showImportBitlyModal &&
+      `/api/workspaces/${workspaceId}/import/bitly`,
     fetcher,
     {
-      revalidateOnFocus: false,
-      revalidateOnMount: false,
-      revalidateOnReconnect: false,
-      refreshWhenOffline: false,
-      refreshWhenHidden: false,
-      refreshInterval: 0,
       onError: (err) => {
         if (err.message !== "No Bitly access token found") {
           toast.error(err.message);
@@ -63,24 +80,27 @@ function ImportBitlyModal({
   >([]);
   const [selectedGroupTags, setSelectedGroupTags] = useState<string[]>([]);
 
-  const [importing, setImporting] = useState(false);
-
   useEffect(() => {
-    if (searchParams?.get("import") === "bitly") {
-      mutate(`/api/workspaces/${id}/import/bitly`);
-      setShowImportBitlyModal(true);
-    } else {
-      setShowImportBitlyModal(false);
+    if (showImportBitlyModal && groups !== undefined) {
+      mutate();
     }
-  }, [searchParams]);
-
-  const bitlyOAuthURL = `https://bitly.com/oauth/authorize?client_id=${process.env.NEXT_PUBLIC_BITLY_CLIENT_ID}&redirect_uri=${process.env.NEXT_PUBLIC_BITLY_REDIRECT_URI}&state=${id}`;
+  }, [showImportBitlyModal]);
 
   const isSelected = (domain: string) => {
     return selectedDomains.find((d) => d.domain === domain) ? true : false;
   };
 
-  const { queryParams } = useRouterStuff();
+  const signInWithBitly = async () => {
+    if (!workspaceId) {
+      return;
+    }
+
+    await executeAsync({
+      provider: "bitly",
+      workspaceId,
+      ...(folderId ? { folderId } : {}),
+    });
+  };
 
   return (
     <Modal
@@ -92,36 +112,36 @@ function ImportBitlyModal({
         })
       }
     >
-      <div className="flex flex-col items-center justify-center space-y-3 border-b border-gray-200 px-4 py-8 sm:px-16">
+      <div className="flex flex-col items-center justify-center space-y-3 border-b border-neutral-200 px-4 py-8 sm:px-16">
         <div className="flex items-center space-x-3 py-4">
           <img
-            src="/_static/icons/bitly.svg"
+            src="https://assets.dub.co/misc/icons/bitly.svg"
             alt="Bitly logo"
             className="h-10 w-10 rounded-full"
           />
-          <ArrowRight className="h-5 w-5 text-gray-600" />
+          <ArrowRight className="h-5 w-5 text-neutral-600" />
           <Logo />
         </div>
         <h3 className="text-lg font-medium">Import Your Bitly Links</h3>
-        <p className="text-center text-sm text-gray-500">
-          Easily import all your existing Bitly links into{" "}
-          {process.env.NEXT_PUBLIC_APP_NAME} with just a few clicks.
+        <p className="text-center text-sm text-neutral-500">
+          Easily import all your existing Bitly links into Dub with just a few
+          clicks.
         </p>
       </div>
 
-      <div className="flex flex-col space-y-6 bg-gray-50 px-4 py-8 text-left sm:px-16">
-        {isLoading ? (
-          <button className="flex flex-col items-center justify-center space-y-4 bg-none">
+      <div className="flex flex-col space-y-6 bg-neutral-50 px-4 py-8 text-left sm:px-16">
+        {isLoading || !workspaceId ? (
+          <div className="flex flex-col items-center justify-center space-y-4 bg-none">
             <LoadingSpinner />
-            <p className="text-sm text-gray-500">Connecting to Bitly</p>
-          </button>
+            <p className="text-sm text-neutral-500">Connecting to Bitly</p>
+          </div>
         ) : groups ? (
           <form
             onSubmit={async (e) => {
               e.preventDefault();
               setImporting(true);
               toast.promise(
-                fetch(`/api/workspaces/${id}/import/bitly`, {
+                fetch(`/api/workspaces/${workspaceId}/import/bitly`, {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/json",
@@ -129,11 +149,14 @@ function ImportBitlyModal({
                   body: JSON.stringify({
                     selectedDomains,
                     selectedGroupTags,
+                    ...(folderId ? { folderId } : {}),
                   }),
                 }).then(async (res) => {
                   if (res.ok) {
-                    await mutate(`/api/domains?workspaceId=${id}`);
-                    router.push(`/${slug}`);
+                    await mutate();
+                    queryParams({
+                      del: "import",
+                    });
                   } else {
                     setImporting(false);
                     throw new Error();
@@ -149,16 +172,16 @@ function ImportBitlyModal({
             }}
             className="flex flex-col space-y-4"
           >
-            <div className="divide-y divide-gray-200">
+            <div className="divide-y divide-neutral-200">
               {groups.length > 0 ? (
                 groups.map(({ guid, bsds, tags }) => (
                   <div key={guid} className="flex flex-col space-y-2">
                     <div className="flex items-center justify-between">
-                      <p className="text-sm font-medium text-gray-700">
+                      <p className="text-sm font-medium text-neutral-700">
                         Domains
                       </p>
                       <Tooltip content="Your Bitly group ID">
-                        <p className="cursor-default text-xs uppercase text-gray-400 transition-colors hover:text-gray-700">
+                        <p className="cursor-default text-xs uppercase text-neutral-400 transition-colors hover:text-neutral-700">
                           {guid}
                         </p>
                       </Tooltip>
@@ -166,9 +189,9 @@ function ImportBitlyModal({
                     {bsds.map((bsd) => (
                       <div
                         key={bsd}
-                        className="flex items-center justify-between space-x-2 rounded-md border border-gray-200 bg-white px-4 py-2"
+                        className="flex items-center justify-between space-x-2 rounded-md border border-neutral-200 bg-white px-4 py-2"
                       >
-                        <p className="font-medium text-gray-800">{bsd}</p>
+                        <p className="font-medium text-neutral-800">{bsd}</p>
                         <Switch
                           fn={() => {
                             const selected = isSelected(bsd);
@@ -190,29 +213,31 @@ function ImportBitlyModal({
                         />
                       </div>
                     ))}
-                    <div className="flex items-center justify-between space-x-2 rounded-md py-1 pl-2 pr-4">
-                      <p className="text-xs text-gray-500">
-                        {tags.length} tags found. Import all?
-                      </p>
-                      <Switch
-                        fn={() => {
-                          if (selectedGroupTags.includes(guid)) {
-                            setSelectedGroupTags((prev) =>
-                              prev.filter((g) => g !== guid),
-                            );
-                          } else {
-                            setSelectedGroupTags((prev) => [...prev, guid]);
-                          }
-                        }}
-                        checked={selectedGroupTags.includes(guid)}
-                      />
-                    </div>
+                    {tags?.length > 0 && (
+                      <div className="flex items-center justify-between space-x-2 rounded-md py-1 pl-2 pr-4">
+                        <p className="text-xs text-neutral-500">
+                          {tags.length} tags found. Import all?
+                        </p>
+                        <Switch
+                          fn={() => {
+                            if (selectedGroupTags.includes(guid)) {
+                              setSelectedGroupTags((prev) =>
+                                prev.filter((g) => g !== guid),
+                              );
+                            } else {
+                              setSelectedGroupTags((prev) => [...prev, guid]);
+                            }
+                          }}
+                          checked={selectedGroupTags.includes(guid)}
+                        />
+                      </div>
+                    )}
                   </div>
                 ))
               ) : (
-                <div className="flex flex-col items-center justify-center space-y-2 pb-2">
-                  <ServerOff className="h-6 w-6 text-gray-500" />
-                  <p className="text-center text-sm text-gray-500">
+                <div className="flex flex-col items-center justify-center gap-2 pb-2">
+                  <ServerOff className="h-6 w-6 text-neutral-500" />
+                  <p className="text-center text-sm text-neutral-500">
                     It looks like you don't have any Bitly groups with custom
                     domains (non bit.ly domains).
                   </p>
@@ -224,35 +249,34 @@ function ImportBitlyModal({
               loading={importing}
               disabled={selectedDomains.length === 0}
             />
-            <a
-              href={bitlyOAuthURL}
-              className="text-center text-xs text-gray-500 underline underline-offset-4 transition-colors hover:text-gray-800"
+            <button
+              type="button"
+              onClick={signInWithBitly}
+              disabled={isPending}
+              className="text-center text-xs text-neutral-500 underline underline-offset-4 transition-colors hover:text-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
             >
               Sign in to a different Bitly account?
-            </a>
+            </button>
           </form>
         ) : (
           <div className="flex flex-col space-y-2">
             <Button
               text="Sign in with Bitly"
               variant="secondary"
-              loading={redirecting}
+              loading={isPending}
               icon={
                 <img
-                  src="/_static/icons/bitly.svg"
+                  src="https://assets.dub.co/misc/icons/bitly.svg"
                   alt="Bitly logo"
-                  className="h-5 w-5 rounded-full border border-gray-200"
+                  className="h-5 w-5 rounded-full border border-neutral-200"
                 />
               }
-              onClick={() => {
-                setRedirecting(true);
-                router.push(bitlyOAuthURL);
-              }}
+              onClick={signInWithBitly}
             />
             <a
               href="https://dub.co/help/article/migrating-from-bitly"
               target="_blank"
-              className="text-center text-xs text-gray-500 underline underline-offset-4 transition-colors hover:text-gray-800"
+              className="text-center text-xs text-neutral-500 underline underline-offset-4 transition-colors hover:text-neutral-800"
             >
               Read the guide
             </a>
@@ -264,7 +288,8 @@ function ImportBitlyModal({
 }
 
 export function useImportBitlyModal() {
-  const [showImportBitlyModal, setShowImportBitlyModal] = useState(false);
+  const [showImportBitlyModal, setShowImportBitlyModal] =
+    useImportModalParam("bitly");
 
   const ImportBitlyModalCallback = useCallback(() => {
     return (

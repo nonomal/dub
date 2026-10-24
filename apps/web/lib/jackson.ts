@@ -2,10 +2,10 @@ import type {
   IConnectionAPIController,
   IDirectorySyncController,
   IOAuthController,
-  ISPSAMLConfig,
   JacksonOption,
 } from "@boxyhq/saml-jackson";
-import jackson from "@boxyhq/saml-jackson";
+import samlJackson from "@boxyhq/saml-jackson";
+import { APP_DOMAIN_WITH_NGROK } from "@dub/utils";
 
 export const samlAudience = "https://saml.dub.co";
 
@@ -13,7 +13,7 @@ const opts: JacksonOption = {
   externalUrl:
     process.env.NODE_ENV === "production"
       ? "https://api.dub.co"
-      : `${process.env.NEXTAUTH_URL}`,
+      : APP_DOMAIN_WITH_NGROK,
   samlPath:
     process.env.NODE_ENV === "production"
       ? "/auth/saml/callback"
@@ -34,34 +34,26 @@ const opts: JacksonOption = {
 };
 
 declare global {
-  var connectionController: IConnectionAPIController | undefined;
   var apiController: IConnectionAPIController | undefined;
   var oauthController: IOAuthController | undefined;
-  var samlSPConfig: ISPSAMLConfig | undefined;
   var directorySyncController: IDirectorySyncController | undefined;
 }
 
-export default async function init() {
+export async function jackson() {
   if (
-    !globalThis.connectionController ||
     !globalThis.apiController ||
     !globalThis.oauthController ||
-    !globalThis.samlSPConfig ||
     !globalThis.directorySyncController
   ) {
-    const ret = await jackson(opts);
-    globalThis.connectionController = ret.connectionAPIController;
+    const ret = await samlJackson(opts);
     globalThis.apiController = ret.connectionAPIController;
     globalThis.oauthController = ret.oauthController;
-    globalThis.samlSPConfig = ret.spConfig;
     globalThis.directorySyncController = ret.directorySyncController;
   }
 
   return {
-    connectionController: globalThis.connectionController,
     apiController: globalThis.apiController,
     oauthController: globalThis.oauthController,
-    samlSPConfig: globalThis.samlSPConfig,
     directorySyncController: globalThis.directorySyncController,
   };
 }

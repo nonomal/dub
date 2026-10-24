@@ -1,18 +1,24 @@
-import {
-  addDomainToVercel,
-  domainExists,
-  setRootDomain,
-} from "@/lib/api/domains";
+import { isCI } from "@/lib/api/environment";
 import { DubApiError } from "@/lib/api/errors";
+import { generateRandomString } from "@/lib/api/utils/generate-random-string";
+import { createWorkspaceId } from "@/lib/api/workspaces/create-workspace-id";
+import { prefixWorkspaceId } from "@/lib/api/workspaces/workspace-id";
 import { withSession } from "@/lib/auth";
-import prisma from "@/lib/prisma";
-import { createWorkspaceSchema } from "@/lib/zod/schemas";
-import { FREE_WORKSPACES_LIMIT, nanoid } from "@dub/utils";
+import { checkIfUserExists } from "@/lib/planetscale";
+import { prisma } from "@/lib/prisma";
+import { storage } from "@/lib/storage";
+import {
+  createWorkspaceSchema,
+  WorkspaceSchema,
+} from "@/lib/zod/schemas/workspaces";
+import { FREE_WORKSPACES_LIMIT, nanoid, R2_URL } from "@dub/utils";
+import { Prisma } from "@prisma/client";
+import { waitUntil } from "@vercel/functions";
 import { NextResponse } from "next/server";
 
 // GET /api/workspaces - get all projects for the current user
 export const GET = withSession(async ({ session }) => {
-  const projects = await prisma.project.findMany({
+  const workspaces = await prisma.project.findMany({
     where: {
       users: {
         some: {
@@ -27,131 +33,171 @@ export const GET = withSession(async ({ session }) => {
         },
         select: {
           role: true,
+          defaultFolderId: true,
         },
       },
       domains: {
         select: {
           slug: true,
           primary: true,
+          verified: true,
         },
       },
     },
+    orderBy: {
+      createdAt: "asc",
+    },
   });
+
   return NextResponse.json(
-    projects.map((project) => ({ ...project, id: `ws_${project.id}` })),
+    workspaces.map((project) =>
+      WorkspaceSchema.parse({
+        ...project,
+        id: prefixWorkspaceId(project.id),
+      }),
+    ),
   );
 });
 
 export const POST = withSession(async ({ req, session }) => {
-  const { name, slug, domain } = await createWorkspaceSchema.parseAsync(
+  const { name, slug, logo } = await createWorkspaceSchema.parseAsync(
     await req.json(),
   );
 
-  const freeWorkspaces = await prisma.project.count({
-    where: {
-      plan: "free",
-      users: {
-        some: {
-          userId: session.user.id,
-          role: "owner",
-        },
-      },
-    },
-  });
+  const userExists = await checkIfUserExists(session.user.id);
 
-  if (freeWorkspaces >= FREE_WORKSPACES_LIMIT) {
+  if (!userExists) {
     throw new DubApiError({
-      code: "exceeded_limit",
-      message: `You can only create up to ${FREE_WORKSPACES_LIMIT} free workspaces. Additional workspaces require a paid plan.`,
+      code: "not_found",
+      message: "Session expired. Please log in again.",
     });
   }
 
-  const [slugExist, domainExist] = await Promise.all([
-    prisma.project.findUnique({
-      where: {
-        slug,
-      },
-      select: {
-        slug: true,
-      },
-    }),
-    domain ? domainExists(domain) : false,
-  ]);
+  try {
+    let uploadedImageUrl: string | undefined;
 
-  if (slugExist) {
-    throw new DubApiError({
-      code: "conflict",
-      message: "Slug is already in use.",
-    });
-  }
-
-  if (domainExist) {
-    throw new DubApiError({
-      code: "conflict",
-      message: "Domain is already in use.",
-    });
-  }
-
-  const [projectResponse, domainRepsonse] = await Promise.all([
-    prisma.project.create({
-      data: {
-        name,
-        slug,
-        users: {
-          create: {
-            userId: session.user.id,
-            role: "owner",
-          },
-        },
-        ...(domain && {
-          domains: {
-            create: {
-              slug: domain,
-              primary: true,
+    const workspace = await prisma.$transaction(
+      async (tx) => {
+        const freeWorkspaces = await tx.project.count({
+          where: {
+            plan: "free",
+            users: {
+              some: {
+                userId: session.user.id,
+                role: "owner",
+              },
             },
           },
-        }),
-        billingCycleStart: new Date().getDate(),
-        inviteCode: nanoid(24),
-        defaultDomains: {
-          create: {}, // by default, we give users all the default domains when they create a project
-        },
-      },
-      include: {
-        domains: {
-          select: {
-            id: true,
-            slug: true,
-            primary: true,
-          },
-        },
-        users: {
-          select: {
-            role: true,
-          },
-        },
-      },
-    }),
-    domain && addDomainToVercel(domain),
-  ]);
+        });
 
-  // if domain is specified and it was successfully added to Vercel
-  // update it in Redis cache
-  if (domain && domainRepsonse && !domainRepsonse.error) {
-    await setRootDomain({
-      id: projectResponse.domains[0].id,
-      domain,
-      projectId: projectResponse.id,
+        // apply free workspaces limit (if not in CI)
+        if (freeWorkspaces >= FREE_WORKSPACES_LIMIT && !isCI) {
+          throw new DubApiError({
+            code: "exceeded_limit",
+            message: `You can only create up to ${FREE_WORKSPACES_LIMIT} free workspaces. Additional workspaces require a paid plan.`,
+          });
+        }
+
+        const workspaceId = createWorkspaceId();
+        uploadedImageUrl = logo
+          ? `${R2_URL}/workspaces/${workspaceId}/logo_${nanoid(7)}`
+          : undefined;
+
+        return await tx.project.create({
+          data: {
+            id: workspaceId,
+            name,
+            slug,
+            logo: uploadedImageUrl,
+            users: {
+              create: {
+                userId: session.user.id,
+                role: "owner",
+                notificationPreference: {
+                  create: {},
+                },
+              },
+            },
+            billingCycleStart: new Date().getDate(),
+            invoicePrefix: generateRandomString(8),
+            inviteCode: nanoid(24),
+            defaultDomains: {
+              create: {}, // by default, we give users all the default domains when they create a project
+            },
+          },
+          include: {
+            users: {
+              where: {
+                userId: session.user.id,
+              },
+              select: {
+                role: true,
+                defaultFolderId: true,
+              },
+            },
+            domains: {
+              select: {
+                slug: true,
+                primary: true,
+              },
+            },
+          },
+        });
+      },
+      {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        maxWait: 5000,
+        timeout: 5000,
+      },
+    );
+
+    waitUntil(
+      Promise.allSettled([
+        // if the user has no default workspace, set the new workspace as the default
+        session.user["defaultWorkspace"] === null &&
+          prisma.user.update({
+            where: {
+              id: session.user.id,
+            },
+            data: {
+              defaultWorkspace: workspace.slug,
+            },
+          }),
+
+        // Upload logo to R2 if uploaded
+        logo &&
+          uploadedImageUrl &&
+          storage.upload({
+            key: uploadedImageUrl.replace(`${R2_URL}/`, ""),
+            body: logo,
+          }),
+      ]),
+    );
+
+    return NextResponse.json(
+      WorkspaceSchema.parse({
+        ...workspace,
+        id: prefixWorkspaceId(workspace.id),
+      }),
+    );
+  } catch (error) {
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2002"
+    ) {
+      throw new DubApiError({
+        code: "conflict",
+        message: `The slug "${slug}" is already in use.`,
+      });
+    }
+
+    if (error instanceof DubApiError) {
+      throw error;
+    }
+
+    throw new DubApiError({
+      code: "internal_server_error",
+      message: "Error creating workspace. Please try again later.",
     });
   }
-
-  const response = {
-    ...projectResponse,
-    domains: projectResponse.domains.map(({ slug, primary }) => ({
-      slug,
-      primary,
-    })),
-  };
-
-  return NextResponse.json(response);
 });

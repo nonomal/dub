@@ -1,41 +1,76 @@
-import prisma from "@/lib/prisma";
-import z from "@/lib/zod";
-import { getLinksCountQuerySchema } from "@/lib/zod/schemas";
-import { combineTagIds } from "./utils";
+import { combineTagIds } from "@/lib/api/tags/combine-tag-ids";
+import { prisma } from "@/lib/prisma";
+import { getLinksCountQuerySchema } from "@/lib/zod/schemas/links";
+import * as z from "zod/v4";
+
+interface GetLinksCountParams extends z.infer<typeof getLinksCountQuerySchema> {
+  workspaceId: string;
+  folderIds?: string[];
+}
 
 export async function getLinksCount({
-  searchParams,
-  workspaceId,
+  groupBy,
+  search,
+  domain,
+  tagId,
+  tagIds,
+  tagNames,
   userId,
-}: {
-  searchParams: z.infer<typeof getLinksCountQuerySchema>;
-  workspaceId: string;
-  userId?: string | null;
-}) {
-  const { groupBy, search, domain, tagId, tagIds, showArchived, withTags } =
-    searchParams;
-
+  showArchived,
+  withTags,
+  folderId,
+  tenantId,
+  workspaceId,
+  folderIds,
+}: GetLinksCountParams) {
   const combinedTagIds = combineTagIds({ tagId, tagIds });
 
   const linksWhere = {
     projectId: workspaceId,
+    AND: [
+      ...(folderIds
+        ? [
+            {
+              OR: [
+                {
+                  folderId: {
+                    in: folderIds,
+                  },
+                },
+                {
+                  folderId: null,
+                },
+              ],
+            },
+          ]
+        : groupBy !== "folderId"
+          ? [
+              {
+                folderId: folderId || null,
+              },
+            ]
+          : []),
+      ...(search
+        ? [
+            {
+              OR: [
+                { shortLink: { contains: search } },
+                { url: { contains: search } },
+              ],
+            },
+          ]
+        : []),
+    ],
     archived: showArchived ? undefined : false,
-    ...(userId && { userId }),
-    ...(search && {
-      OR: [
-        {
-          key: { contains: search },
-        },
-        {
-          url: { contains: search },
-        },
-      ],
-    }),
-    // when filtering by domain, only filter by domain if the filter group is not "Domains"
     ...(domain &&
       groupBy !== "domain" && {
         domain,
       }),
+    ...(userId &&
+      groupBy !== "userId" && {
+        userId,
+      }),
+    ...(tenantId && { tenantId }),
   };
 
   if (groupBy === "tagId") {
@@ -59,18 +94,30 @@ export async function getLinksCount({
           some: {},
         },
       }),
-      ...(combinedTagIds.length > 0 && {
-        tags: {
-          some: {
-            tagId: {
-              in: tagIds,
-            },
-          },
-        },
-      }),
+      ...(combinedTagIds && combinedTagIds.length > 0
+        ? {
+            tags: { some: { tagId: { in: combinedTagIds } } },
+          }
+        : tagNames
+          ? {
+              tags: {
+                some: {
+                  tag: {
+                    name: {
+                      in: tagNames,
+                    },
+                  },
+                },
+              },
+            }
+          : {}),
     };
 
-    if (groupBy === "domain") {
+    if (
+      groupBy === "domain" ||
+      groupBy === "userId" ||
+      groupBy === "folderId"
+    ) {
       return await prisma.link.groupBy({
         by: [groupBy],
         where,

@@ -1,88 +1,364 @@
+import { allowedHostnamesCache } from "@/lib/analytics/allowed-hostnames-cache";
 import { DubApiError } from "@/lib/api/errors";
-import { deleteWorkspace } from "@/lib/api/workspaces";
-import { withAuth } from "@/lib/auth";
-import { isReservedKey } from "@/lib/edge-config";
-import prisma from "@/lib/prisma";
-import z from "@/lib/zod";
-import { DEFAULT_REDIRECTS, trim, validSlugRegex } from "@dub/utils";
-import slugify from "@sindresorhus/slugify";
+import { parseRequestBody } from "@/lib/api/utils";
+import { validateAllowedHostnames } from "@/lib/api/validate-allowed-hostnames";
+import { deleteWorkspace } from "@/lib/api/workspaces/delete-workspace";
+import { prefixWorkspaceId } from "@/lib/api/workspaces/workspace-id";
+import { getWorkspaceLogoKeyPrefix } from "@/lib/api/workspaces/workspace-logo";
+import { workspaceProductCache } from "@/lib/api/workspaces/workspace-product-cache";
+import { withWorkspace } from "@/lib/auth";
+import { getFeatureFlags } from "@/lib/edge-config";
+import { jackson } from "@/lib/jackson";
+import { syncStagingWorkspaceJob } from "@/lib/jobs/handlers/sync-staging-workspace-job";
+import { prisma } from "@/lib/prisma";
+import {
+  getPublishableKeyPrefix,
+  isValidPublishableKeyForEnvironment,
+} from "@/lib/sandbox/environment";
+import { assertNotStagingWorkspace } from "@/lib/sandbox/workspace-guards";
+import { mergeSiteVisitTrackingSettings } from "@/lib/sitemaps/site-visit-tracking";
+import { storage } from "@/lib/storage";
+import {
+  createWorkspaceSchema,
+  siteVisitTrackingSettingsPatchSchema,
+  WorkspaceSchema,
+  WorkspaceSchemaExtended,
+} from "@/lib/zod/schemas/workspaces";
+import { nanoid, R2_URL } from "@dub/utils";
+import { Prisma } from "@prisma/client";
+import { waitUntil } from "@vercel/functions";
 import { NextResponse } from "next/server";
+import * as z from "zod/v4";
 
-const updateWorkspaceSchema = z.object({
-  name: z.preprocess(trim, z.string().min(1).max(32)).optional(),
-  slug: z
-    .preprocess(
-      trim,
-      z
-        .string()
-        .min(3, "Slug must be at least 3 characters")
-        .max(48, "Slug must be less than 48 characters")
-        .transform((v) => slugify(v))
-        .refine((v) => validSlugRegex.test(v), {
-          message: "Invalid slug format",
-        })
-        .refine(
-          async (v) => !((await isReservedKey(v)) || DEFAULT_REDIRECTS[v]),
-          {
-            message: "Cannot use reserved slugs",
-          },
-        ),
-    )
-    .optional(),
-});
+const updateWorkspaceSchema = createWorkspaceSchema
+  .extend({
+    defaultProduct: z.enum(["program", "links"]).optional(),
+    allowedHostnames: z.array(z.string()).optional(),
+    publishableKey: z
+      .union([
+        z
+          .string()
+          .regex(
+            /^dub_pk_[A-Za-z0-9_-]{16,64}$/,
+            "Invalid publishable key format",
+          ),
+        z.null(),
+      ])
+      .optional(),
+    enforceSAML: z.boolean().nullish(),
+    siteVisitTrackingSettings: siteVisitTrackingSettingsPatchSchema
+      .nullable()
+      .optional(),
+  })
+  .partial();
 
 // GET /api/workspaces/[idOrSlug] – get a specific workspace by id or slug
-export const GET = withAuth(async ({ workspace, headers }) => {
-  return NextResponse.json(
-    {
-      ...workspace,
-      id: `ws_${workspace.id}`,
-    },
-    { headers },
-  );
-});
+export const GET = withWorkspace(
+  async ({ workspace, headers }) => {
+    const domains = await prisma.domain.findMany({
+      where: {
+        projectId: workspace.id,
+      },
+      select: {
+        id: true,
+        slug: true,
+        primary: true,
+        verified: true,
+        linkRetentionDays: true,
+      },
+      take: 100,
+    });
 
-// PUT /api/workspaces/[idOrSlug] – update a specific workspace by id or slug
-export const PUT = withAuth(
+    const flags = await getFeatureFlags({
+      workspaceId: workspace.id,
+    });
+
+    return NextResponse.json(
+      {
+        ...WorkspaceSchemaExtended.parse({
+          ...workspace,
+          id: prefixWorkspaceId(workspace.id),
+          domains,
+          flags,
+        }),
+      },
+      { headers },
+    );
+  },
+  {
+    requiredPermissions: ["workspaces.read"],
+  },
+);
+
+// PATCH /api/workspaces/[idOrSlug] – update a specific workspace by id or slug
+export const PATCH = withWorkspace(
   async ({ req, workspace }) => {
-    try {
-      const { name, slug } = await updateWorkspaceSchema.parseAsync(
-        await req.json(),
+    const {
+      name,
+      slug,
+      logo,
+      defaultProduct,
+      conversionEnabled,
+      allowedHostnames,
+      publishableKey,
+      enforceSAML,
+      siteVisitTrackingSettings,
+    } = await updateWorkspaceSchema.parseAsync(await parseRequestBody(req));
+
+    assertNotStagingWorkspace(workspace, {
+      when: !!(name || slug || logo),
+    });
+
+    const isNewPublishableKey =
+      !!publishableKey && publishableKey !== workspace.publishableKey;
+
+    const matchesEnvironment =
+      !!publishableKey &&
+      isValidPublishableKeyForEnvironment(
+        publishableKey,
+        workspace.environment,
       );
 
-      const response = await prisma.project.update({
+    if (isNewPublishableKey && !matchesEnvironment) {
+      throw new DubApiError({
+        code: "bad_request",
+        message: `Publishable keys for ${workspace.environment} workspaces must start with "${getPublishableKeyPrefix(workspace.environment)}".`,
+      });
+    }
+
+    if (["free", "pro"].includes(workspace.plan) && conversionEnabled) {
+      throw new DubApiError({
+        code: "forbidden",
+        message: "Conversion tracking is not available on free or pro plans.",
+      });
+    }
+
+    const validHostnames = allowedHostnames
+      ? validateAllowedHostnames(allowedHostnames)
+      : undefined;
+
+    const logoUploaded = logo
+      ? await storage.upload({
+          key: `${getWorkspaceLogoKeyPrefix(workspace.id)}${nanoid(7)}`,
+          body: logo,
+        })
+      : null;
+
+    if (enforceSAML) {
+      if (workspace.plan !== "enterprise") {
+        throw new DubApiError({
+          code: "forbidden",
+          message: "SAML SSO is only available on enterprise plans.",
+        });
+      }
+
+      const { apiController } = await jackson();
+
+      const connections = await apiController.getConnections({
+        tenant: workspace.id,
+        product: "Dub",
+      });
+
+      if (connections.length === 0) {
+        throw new DubApiError({
+          code: "forbidden",
+          message: "SAML SSO is not configured for this workspace.",
+        });
+      }
+    }
+
+    const flags = await getFeatureFlags({
+      workspaceId: workspace.id,
+    });
+
+    const mergedSiteVisitTrackingSettings =
+      siteVisitTrackingSettings !== undefined
+        ? mergeSiteVisitTrackingSettings(
+            workspace.siteVisitTrackingSettings,
+            siteVisitTrackingSettings,
+          )
+        : undefined;
+
+    if (
+      mergedSiteVisitTrackingSettings !== undefined &&
+      mergedSiteVisitTrackingSettings !== null &&
+      mergedSiteVisitTrackingSettings.siteDomainSlug
+    ) {
+      if (!flags.analyticsSettingsSiteVisitTracking) {
+        throw new DubApiError({
+          code: "forbidden",
+          message:
+            "Site visit tracking is not enabled for this workspace. Please contact support to enable it.",
+        });
+      }
+
+      const domain = await prisma.domain.findFirst({
+        where: {
+          projectId: workspace.id,
+          slug: mergedSiteVisitTrackingSettings.siteDomainSlug,
+          archived: false,
+        },
+      });
+
+      if (!domain) {
+        throw new DubApiError({
+          code: "bad_request",
+          message:
+            "The selected site links domain was not found for this workspace.",
+        });
+      }
+    }
+
+    try {
+      const updatedWorkspace = await prisma.project.update({
         where: {
           slug: workspace.slug,
         },
         data: {
           ...(name && { name }),
           ...(slug && { slug }),
+          ...(logoUploaded && { logo: logoUploaded.url }),
+          ...(defaultProduct && { defaultProduct }),
+          ...(conversionEnabled !== undefined && { conversionEnabled }),
+          ...(validHostnames !== undefined && {
+            allowedHostnames: validHostnames,
+          }),
+          ...(publishableKey !== undefined && { publishableKey }),
+          ...(enforceSAML !== undefined && {
+            ssoEnforcedAt: enforceSAML ? new Date() : null,
+          }),
+          ...(mergedSiteVisitTrackingSettings !== undefined && {
+            siteVisitTrackingSettings:
+              mergedSiteVisitTrackingSettings === null
+                ? Prisma.JsonNull
+                : (mergedSiteVisitTrackingSettings as Prisma.InputJsonValue),
+          }),
+        },
+        include: {
+          domains: {
+            select: {
+              slug: true,
+              primary: true,
+              verified: true,
+            },
+            take: 100,
+          },
+          users: true,
         },
       });
-      return NextResponse.json(response);
+
+      await Promise.allSettled([
+        ...(updatedWorkspace.slug !== workspace.slug
+          ? [
+              prisma.user.updateMany({
+                where: {
+                  defaultWorkspace: workspace.slug,
+                },
+                data: {
+                  defaultWorkspace: updatedWorkspace.slug,
+                },
+              }),
+              // update the workspace product cache for both workspaces
+              workspaceProductCache.set({
+                slug: updatedWorkspace.slug,
+                product: updatedWorkspace.defaultProduct,
+              }),
+              workspaceProductCache.delete({ slug: workspace.slug }),
+            ]
+          : // if only the product has changed, update the cache
+            updatedWorkspace.defaultProduct !== workspace.defaultProduct
+            ? [
+                workspaceProductCache.set({
+                  slug: updatedWorkspace.slug,
+                  product: updatedWorkspace.defaultProduct,
+                }),
+              ]
+            : []),
+      ]);
+
+      waitUntil(
+        (async () => {
+          if (logoUploaded && workspace.logo) {
+            await storage.delete({
+              key: workspace.logo.replace(`${R2_URL}/`, ""),
+            });
+          }
+
+          // Sync the allowedHostnames cache for workspace domains
+          const current = JSON.stringify(workspace.allowedHostnames);
+          const next = JSON.stringify(updatedWorkspace.allowedHostnames);
+          const domains = updatedWorkspace.domains.map(({ slug }) => slug);
+
+          if (current !== next) {
+            if (
+              Array.isArray(updatedWorkspace.allowedHostnames) &&
+              updatedWorkspace.allowedHostnames.length > 0
+            ) {
+              allowedHostnamesCache.mset({
+                allowedHostnames: next,
+                domains,
+              });
+            } else {
+              allowedHostnamesCache.deleteMany({
+                domains,
+              });
+            }
+          }
+
+          await syncStagingWorkspaceJob.dispatch({
+            action: "sync-workspace",
+            workspaceId: updatedWorkspace.id,
+          });
+        })(),
+      );
+
+      return NextResponse.json(
+        WorkspaceSchema.parse({
+          ...updatedWorkspace,
+          id: prefixWorkspaceId(updatedWorkspace.id),
+        }),
+      );
     } catch (error) {
       if (error.code === "P2002") {
         throw new DubApiError({
           code: "conflict",
-          message: "Workspace slug already exists.",
+          message: `The slug "${slug}" is already in use.`,
+        });
+      } else {
+        throw new DubApiError({
+          code: "internal_server_error",
+          message: error.message,
         });
       }
-
-      throw error;
     }
   },
   {
-    requiredRole: ["owner"],
+    requiredPermissions: ["workspaces.write"],
   },
 );
 
+export const PUT = PATCH;
+
 // DELETE /api/workspaces/[idOrSlug] – delete a specific project
-export const DELETE = withAuth(
+export const DELETE = withWorkspace(
   async ({ workspace }) => {
-    const response = await deleteWorkspace(workspace);
-    return NextResponse.json(response);
+    if (workspace.defaultProgramId) {
+      throw new DubApiError({
+        code: "bad_request",
+        message:
+          "You cannot delete a workspace with an active partner program.",
+      });
+    }
+
+    assertNotStagingWorkspace(workspace, {
+      message: "Deleting a staging workspace is not allowed.",
+    });
+
+    await deleteWorkspace(workspace);
+
+    return NextResponse.json(workspace);
   },
   {
-    requiredRole: ["owner"],
+    requiredPermissions: ["workspaces.write"],
   },
 );

@@ -1,8 +1,8 @@
 import { DubApiError } from "@/lib/api/errors";
-import { withAuth } from "@/lib/auth";
-import jackson from "@/lib/jackson";
-import z from "@/lib/zod";
+import { withWorkspace } from "@/lib/auth";
+import { jackson } from "@/lib/jackson";
 import { NextResponse } from "next/server";
+import * as z from "zod/v4";
 
 const createDirectorySchema = z.object({
   provider: z.enum(["okta-scim-v2", "azure-scim-v2", "google"]).optional(),
@@ -14,33 +14,60 @@ const deleteDirectorySchema = z.object({
 });
 
 // GET /api/workspaces/[idOrSlug]/scim – get all SCIM directories
-export const GET = withAuth(async ({ workspace }) => {
-  const { directorySyncController } = await jackson();
+export const GET = withWorkspace(
+  async ({ workspace }) => {
+    const { directorySyncController } = await jackson();
 
-  const { data, error } =
-    await directorySyncController.directories.getByTenantAndProduct(
-      workspace.id,
-      "Dub",
-    );
-  if (error) {
-    throw new DubApiError({
-      code: "internal_server_error",
-      message: error.message,
+    const { data, error } =
+      await directorySyncController.directories.getByTenantAndProduct(
+        workspace.id,
+        "Dub",
+      );
+    if (error) {
+      throw new DubApiError({
+        code: "internal_server_error",
+        message: error.message,
+      });
+    }
+
+    return NextResponse.json({
+      directories: data,
     });
-  }
-
-  return NextResponse.json({
-    directories: data,
-  });
-});
+  },
+  {
+    requiredPermissions: ["workspaces.read"],
+  },
+);
 
 // POST /api/workspaces/[idOrSlug]/scim – create a new SCIM directory
-export const POST = withAuth(
+export const POST = withWorkspace(
   async ({ req, workspace }) => {
     const { provider = "okta-scim-v2", currentDirectoryId } =
       createDirectorySchema.parse(await req.json());
 
     const { directorySyncController } = await jackson();
+
+    if (currentDirectoryId) {
+      const directory =
+        await directorySyncController.directories.get(currentDirectoryId);
+
+      if (!directory || directory.error || !directory.data) {
+        throw new DubApiError({
+          code: "not_found",
+          message: directory?.error?.message ?? "Directory not found.",
+        });
+      }
+
+      if (
+        directory.data.tenant !== workspace.id ||
+        directory.data.product !== "Dub"
+      ) {
+        throw new DubApiError({
+          code: "not_found",
+          message: "Directory not found.",
+        });
+      }
+    }
 
     const [data, _] = await Promise.all([
       directorySyncController.directories.create({
@@ -49,6 +76,7 @@ export const POST = withAuth(
         product: "Dub",
         type: provider,
       }),
+
       currentDirectoryId &&
         directorySyncController.directories.delete(currentDirectoryId),
     ]);
@@ -56,18 +84,37 @@ export const POST = withAuth(
     return NextResponse.json(data);
   },
   {
-    requiredRole: ["owner"],
+    requiredPermissions: ["workspaces.write"],
     requiredPlan: ["enterprise"],
   },
 );
 
 // DELETE /api/workspaces/[idOrSlug]/scim – delete a SCIM directory
-
-export const DELETE = withAuth(
-  async ({ searchParams }) => {
+export const DELETE = withWorkspace(
+  async ({ workspace, searchParams }) => {
     const { directoryId } = deleteDirectorySchema.parse(searchParams);
 
     const { directorySyncController } = await jackson();
+
+    const directory =
+      await directorySyncController.directories.get(directoryId);
+
+    if (!directory || directory.error || !directory.data) {
+      throw new DubApiError({
+        code: "not_found",
+        message: directory?.error?.message ?? "Directory not found.",
+      });
+    }
+
+    if (
+      directory.data.tenant !== workspace.id ||
+      directory.data.product !== "Dub"
+    ) {
+      throw new DubApiError({
+        code: "not_found",
+        message: "Directory not found.",
+      });
+    }
 
     const { error, data } =
       await directorySyncController.directories.delete(directoryId);
@@ -82,6 +129,6 @@ export const DELETE = withAuth(
     return NextResponse.json(data);
   },
   {
-    requiredRole: ["owner"],
+    requiredPermissions: ["workspaces.write"],
   },
 );

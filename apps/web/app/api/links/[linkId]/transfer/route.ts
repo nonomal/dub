@@ -1,24 +1,56 @@
-import { getAnalytics } from "@/lib/analytics";
 import { DubApiError } from "@/lib/api/errors";
-import { withAuth } from "@/lib/auth";
-import prisma from "@/lib/prisma";
+import { linkCache } from "@/lib/api/links/cache";
+import { getLinkOrThrow } from "@/lib/api/links/get-link-or-throw";
+import { normalizeWorkspaceId } from "@/lib/api/workspaces/workspace-id";
+import { withWorkspace } from "@/lib/auth";
+import { verifyFolderAccess } from "@/lib/folder/permissions";
+import { prisma } from "@/lib/prisma";
 import { recordLink } from "@/lib/tinybird";
-import { formatRedisLink, redis } from "@/lib/upstash";
-import z from "@/lib/zod";
+import { isDubDomain } from "@dub/utils";
+import { waitUntil } from "@vercel/functions";
 import { NextResponse } from "next/server";
+import * as z from "zod/v4";
 
 const transferLinkBodySchema = z.object({
   newWorkspaceId: z
     .string()
     .min(1, "Missing new workspace ID.")
-    // replace "ws_" with "" to get the workspace ID
-    .transform((v) => v.replace("ws_", "")),
+    .transform((v) => normalizeWorkspaceId(v)),
 });
 
 // POST /api/links/[linkId]/transfer – transfer a link to another workspace
-export const POST = withAuth(
+export const POST = withWorkspace(
   async ({ req, headers, session, params, workspace }) => {
+    const link = await getLinkOrThrow({
+      workspaceId: workspace.id,
+      linkId: params.linkId,
+    });
+
+    if (!isDubDomain(link.domain)) {
+      throw new DubApiError({
+        code: "bad_request",
+        message:
+          "You can only transfer Dub default domain links to another workspace.",
+      });
+    }
+
+    if (link.folderId) {
+      await verifyFolderAccess({
+        workspace,
+        userId: session.user.id,
+        folderId: link.folderId,
+        requiredPermission: "folders.links.write",
+      });
+    }
+
     const { newWorkspaceId } = transferLinkBodySchema.parse(await req.json());
+
+    if (newWorkspaceId === workspace.id) {
+      throw new DubApiError({
+        code: "bad_request",
+        message: "You cannot transfer a link to the same workspace.",
+      });
+    }
 
     const newWorkspace = await prisma.project.findUnique({
       where: { id: newWorkspaceId },
@@ -36,22 +68,6 @@ export const POST = withAuth(
       },
     });
 
-    const link = await prisma.link.findUnique({
-      where: {
-        id: params.linkId,
-      },
-      include: {
-        tags: true,
-      },
-    });
-    // technically this is not needed since the link is already checked in withAuth
-    if (!link) {
-      throw new DubApiError({
-        code: "not_found",
-        message: "Link not found.",
-      });
-    }
-
     if (!newWorkspace || newWorkspace.users.length === 0) {
       throw new DubApiError({
         code: "not_found",
@@ -66,69 +82,51 @@ export const POST = withAuth(
       });
     }
 
-    const linkClicks = await getAnalytics({
-      linkId: link.id,
-      endpoint: "clicks",
-      interval: "30d",
+    const updatedLink = await prisma.link.update({
+      where: {
+        id: link.id,
+      },
+      data: {
+        projectId: newWorkspaceId,
+        // reset all stats, tags, and folder when transferring link
+        clicks: 0,
+        leads: 0,
+        sales: 0,
+        saleAmount: 0,
+        conversions: 0,
+        lastClicked: null,
+        lastLeadAt: null,
+        lastConversionAt: null,
+        tags: {
+          deleteMany: {},
+        },
+        folderId: null,
+      },
     });
 
-    const response = await Promise.all([
-      prisma.link.update({
-        where: {
-          id: link.id,
-        },
-        data: {
-          projectId: newWorkspaceId,
-          // remove tags when transferring link
-          tags: {
-            deleteMany: {},
-          },
-        },
-      }),
-      redis.hset(link.domain.toLowerCase(), {
-        [link.key.toLowerCase()]: await formatRedisLink({
-          ...link,
-          projectId: newWorkspaceId,
-        }),
-      }),
-      recordLink({
-        link: {
-          ...link,
-          projectId: newWorkspaceId,
-        },
-      }),
-      // decrement old workspace usage
-      prisma.project.update({
-        where: {
-          id: workspace.id,
-        },
-        data: {
-          usage: {
-            decrement: linkClicks,
-          },
-          linksUsage: {
-            decrement: 1,
-          },
-        },
-      }),
-      // increment new workspace usage
-      prisma.project.update({
-        where: {
-          id: newWorkspaceId,
-        },
-        data: {
-          usage: {
-            increment: linkClicks,
-          },
-          linksUsage: {
-            increment: 1,
-          },
-        },
-      }),
-    ]);
+    waitUntil(
+      Promise.all([
+        linkCache.set(updatedLink),
 
-    return NextResponse.json(response, {
+        // set the link with the old workspace ID to be deleted in Tinybird
+        recordLink(link, { deleted: true }),
+        // set the link with the new workspace ID to be created in Tinybird
+        recordLink(updatedLink),
+
+        // Remove the webhooks associated with the link
+        prisma.linkWebhook.deleteMany({
+          where: {
+            linkId: link.id,
+          },
+        }),
+      ]),
+    );
+
+    return NextResponse.json(updatedLink, {
       headers,
     });
+  },
+  {
+    requiredPermissions: ["links.write"],
   },
 );

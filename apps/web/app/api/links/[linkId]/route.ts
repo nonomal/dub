@@ -1,109 +1,252 @@
 import { DubApiError, ErrorCodes } from "@/lib/api/errors";
-import { deleteLink, editLink, processLink } from "@/lib/api/links";
-import { withAuth } from "@/lib/auth";
-import prisma from "@/lib/prisma";
-import { LinkWithTagIdsProps } from "@/lib/types";
-import { updateLinkBodySchema } from "@/lib/zod/schemas";
+import {
+  deleteLink,
+  processLink,
+  transformLink,
+  updateLink,
+} from "@/lib/api/links";
+import { getLinkOrThrow } from "@/lib/api/links/get-link-or-throw";
+import { partnerRemovalOverrides } from "@/lib/api/links/partner-removal";
+import { isRootDomainLinkKey } from "@/lib/api/links/utils/is-root-domain-link-key";
+import { parseRequestBody } from "@/lib/api/utils";
+import { withWorkspace } from "@/lib/auth";
+import { verifyFolderAccess } from "@/lib/folder/permissions";
+import { prisma } from "@/lib/prisma";
+import { NewLinkProps } from "@/lib/types";
+import { sendWorkspaceWebhook } from "@/lib/webhook/publish";
+import {
+  linkEventSchema,
+  updateLinkBodySchemaExtended,
+} from "@/lib/zod/schemas/links";
+import { deepEqual, UTMTags } from "@dub/utils";
+import { waitUntil } from "@vercel/functions";
 import { NextResponse } from "next/server";
 
 // GET /api/links/[linkId] – get a link
-export const GET = withAuth(async ({ headers, link }) => {
-  if (!link) {
-    throw new DubApiError({
-      code: "not_found",
-      message: "Link not found.",
+export const GET = withWorkspace(
+  async ({ headers, workspace, params, session }) => {
+    const link = await getLinkOrThrow({
+      workspaceId: workspace.id,
+      linkId: params.linkId,
     });
-  }
 
-  const tags = await prisma.tag.findMany({
-    where: {
-      linksNew: {
-        some: {
-          linkId: link.id,
+    if (link.folderId) {
+      await verifyFolderAccess({
+        workspace,
+        userId: session.user.id,
+        folderId: link.folderId,
+        requiredPermission: "folders.read",
+      });
+    }
+
+    const tags = await prisma.tag.findMany({
+      where: {
+        links: {
+          some: {
+            linkId: link.id,
+          },
         },
       },
-    },
-    select: {
-      id: true,
-      name: true,
-      color: true,
-    },
-  });
-  return NextResponse.json(
-    {
+      select: {
+        id: true,
+        name: true,
+        color: true,
+      },
+    });
+
+    const response = transformLink(
+      {
+        ...link,
+        tags: tags.map((tag) => {
+          return { tag };
+        }),
+      },
+      { skipDecodeKey: true },
+    );
+
+    return NextResponse.json(response, { headers });
+  },
+  {
+    requiredPermissions: ["links.read"],
+  },
+);
+
+// PATCH /api/links/[linkId] – update a link
+export const PATCH = withWorkspace(
+  async ({ req, headers, workspace, params, session }) => {
+    const link = await getLinkOrThrow({
+      workspaceId: workspace.id,
+      linkId: params.linkId,
+    });
+
+    const body =
+      (await updateLinkBodySchemaExtended.parseAsync(
+        await parseRequestBody(req),
+      )) || {};
+
+    await Promise.all([
+      ...(link.folderId
+        ? [
+            verifyFolderAccess({
+              workspace,
+              userId: session.user.id,
+              folderId: link.folderId,
+              requiredPermission: "folders.links.write",
+            }),
+          ]
+        : []),
+
+      ...(body.folderId
+        ? [
+            verifyFolderAccess({
+              workspace,
+              userId: session.user.id,
+              folderId: body.folderId,
+              requiredPermission: "folders.links.write",
+            }),
+          ]
+        : []),
+    ]);
+
+    // Add body onto existing link but maintain NewLinkProps form for processLink
+    const updatedLink = {
       ...link,
-      tagId: tags?.[0]?.id ?? null, // backwards compatibility
-      tags,
-    },
-    {
-      headers,
-    },
-  );
-});
+      expiresAt:
+        link.expiresAt instanceof Date
+          ? link.expiresAt.toISOString()
+          : link.expiresAt,
+      geo: link.geo as NewLinkProps["geo"],
+      ...body,
+      ...partnerRemovalOverrides(body),
+      // Only pass UTM tags to processLink when explicitly provided in body (preserves existing values otherwise)
+      ...Object.fromEntries(
+        UTMTags.filter((tag) => tag in body).map((tag) => [tag, body[tag]]),
+      ),
 
-// PUT /api/links/[linkId] – update a link
-export const PUT = withAuth(async ({ req, headers, workspace, link }) => {
-  if (!link) {
-    throw new DubApiError({
-      code: "not_found",
-      message: "Link not found.",
-    });
-  }
+      // When root domain
+      ...(link.key === "_root" && {
+        domain: link.domain,
+        key: link.key,
+      }),
+    };
 
-  const body = updateLinkBodySchema.parse(await req.json());
+    // if link and updatedLink are identical, return the link
+    if (deepEqual(link, updatedLink)) {
+      return NextResponse.json(link, { headers });
+    }
 
-  const updatedLink = {
-    ...link,
-    ...body,
-  };
+    if (updatedLink.projectId !== link?.projectId) {
+      throw new DubApiError({
+        code: "forbidden",
+        message:
+          "Transferring links to another workspace is only allowed via the /links/[linkId]/transfer endpoint.",
+      });
+    }
 
-  if (updatedLink.projectId !== link?.projectId) {
-    throw new DubApiError({
-      code: "forbidden",
-      message:
-        "Transferring links to another workspace is only allowed via the /links/[linkId]transfer endpoint.",
-    });
-  }
-
-  const {
-    link: processedLink,
-    error,
-    code,
-  } = await processLink({
-    payload: updatedLink as LinkWithTagIdsProps,
-    workspace,
     // if domain and key are the same, we don't need to check if the key exists
-    skipKeyChecks:
+    const skipKeyChecks =
       link.domain === updatedLink.domain &&
-      link.key.toLowerCase() === updatedLink.key?.toLowerCase(),
-  });
+      link.key.toLowerCase() === updatedLink.key?.toLowerCase();
 
-  if (error) {
-    throw new DubApiError({
-      code: code as ErrorCodes,
-      message: error,
+    // if externalId is the same, we don't need to check if it exists
+    const skipExternalIdChecks =
+      link.externalId?.toLowerCase() === updatedLink.externalId?.toLowerCase();
+
+    const {
+      link: processedLink,
+      error,
+      code,
+    } = await processLink({
+      payload: updatedLink,
+      workspace,
+      skipKeyChecks,
+      skipExternalIdChecks,
+      skipFolderChecks: true,
     });
-  }
 
-  const response = await editLink({
-    oldDomain: link.domain,
-    oldKey: link.key,
-    updatedLink: processedLink,
-  });
+    if (error) {
+      throw new DubApiError({
+        code: code as ErrorCodes,
+        message: error,
+      });
+    }
 
-  return NextResponse.json(response, {
-    headers,
-  });
-});
+    try {
+      const response = await updateLink({
+        oldLink: {
+          domain: link.domain,
+          key: link.key,
+          image: link.image,
+          programId: link.programId,
+          partnerId: link.partnerId,
+        },
+        updatedLink: processedLink,
+      });
+
+      waitUntil(
+        sendWorkspaceWebhook({
+          trigger: "link.updated",
+          workspace,
+          data: linkEventSchema.parse(response),
+        }),
+      );
+
+      return NextResponse.json(response, {
+        headers,
+      });
+    } catch (error) {
+      throw new DubApiError({
+        code: "unprocessable_entity",
+        message: error.message,
+      });
+    }
+  },
+  {
+    requiredPermissions: ["links.write"],
+  },
+);
+
+// backwards compatibility
+export const PUT = PATCH;
 
 // DELETE /api/links/[linkId] – delete a link
-export const DELETE = withAuth(async ({ headers, link }) => {
-  await deleteLink(link!.id);
+export const DELETE = withWorkspace(
+  async ({ headers, params, workspace, session }) => {
+    const link = await getLinkOrThrow({
+      workspaceId: workspace.id,
+      linkId: params.linkId,
+    });
 
-  return NextResponse.json(
-    { id: link?.id },
-    {
-      headers,
-    },
-  );
-});
+    if (isRootDomainLinkKey(link.key)) {
+      throw new DubApiError({
+        code: "forbidden",
+        message:
+          "You can't delete a custom domain link. You can delete the domain instead.",
+      });
+    }
+
+    if (link.folderId) {
+      await verifyFolderAccess({
+        workspace,
+        userId: session.user.id,
+        folderId: link.folderId,
+        requiredPermission: "folders.links.write",
+      });
+    }
+
+    const response = await deleteLink(link.id);
+
+    waitUntil(
+      sendWorkspaceWebhook({
+        trigger: "link.deleted",
+        workspace,
+        data: linkEventSchema.parse(response),
+      }),
+    );
+
+    return NextResponse.json({ id: link.id }, { headers });
+  },
+  {
+    requiredPermissions: ["links.write"],
+  },
+);

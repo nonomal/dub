@@ -1,3 +1,4 @@
+import useCurrentFolderId from "@/lib/swr/use-current-folder-id";
 import useWorkspace from "@/lib/swr/use-workspace";
 import { ImportedDomainCountProps } from "@/lib/types";
 import {
@@ -6,14 +7,14 @@ import {
   LoadingSpinner,
   Logo,
   Modal,
-  SimpleTooltipContent,
   Switch,
+  buttonVariants,
   useMediaQuery,
   useRouterStuff,
 } from "@dub/ui";
-import { fetcher, nFormatter } from "@dub/utils";
-import { ArrowRight } from "lucide-react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { cn, fetcher, nFormatter } from "@dub/utils";
+import { ArrowRight, ServerOff } from "lucide-react";
+import { useRouter } from "next/navigation";
 import {
   Dispatch,
   SetStateAction,
@@ -23,7 +24,8 @@ import {
   useState,
 } from "react";
 import { toast } from "sonner";
-import useSWR, { mutate } from "swr";
+import useSWRImmutable from "swr/immutable";
+import { useImportModalParam } from "./use-import-modal-param";
 
 function ImportShortModal({
   showImportShortModal,
@@ -33,19 +35,20 @@ function ImportShortModal({
   setShowImportShortModal: Dispatch<SetStateAction<boolean>>;
 }) {
   const router = useRouter();
-  const { id, slug } = useWorkspace();
-  const searchParams = useSearchParams();
+  const { id: workspaceId, slug } = useWorkspace();
 
-  const { data: domains, isLoading } = useSWR<ImportedDomainCountProps[]>(
-    id && showImportShortModal && `/api/workspaces/${id}/import/short`,
+  const { folderId } = useCurrentFolderId();
+
+  const {
+    data: domains,
+    isLoading,
+    mutate,
+  } = useSWRImmutable<ImportedDomainCountProps[]>(
+    workspaceId &&
+      showImportShortModal &&
+      `/api/workspaces/${workspaceId}/import/short`,
     fetcher,
     {
-      revalidateOnFocus: false,
-      revalidateOnMount: false,
-      revalidateOnReconnect: false,
-      refreshWhenOffline: false,
-      refreshWhenHidden: false,
-      refreshInterval: 0,
       onError: (err) => {
         if (err.message !== "No Short.io access token found") {
           toast.error(err.message);
@@ -64,13 +67,10 @@ function ImportShortModal({
   const [importing, setImporting] = useState(false);
 
   useEffect(() => {
-    if (searchParams?.get("import") === "short") {
-      mutate(`/api/workspaces/${id}/import/short`);
-      setShowImportShortModal(true);
-    } else {
-      setShowImportShortModal(false);
+    if (showImportShortModal && domains !== undefined) {
+      mutate();
     }
-  }, [searchParams]);
+  }, [showImportShortModal]);
 
   const isSelected = (domain: string) => {
     return selectedDomains.find((d) => d.domain === domain) ? true : false;
@@ -90,118 +90,141 @@ function ImportShortModal({
         })
       }
     >
-      <div className="flex flex-col items-center justify-center space-y-3 border-b border-gray-200 px-4 py-8 sm:px-16">
+      <div className="flex flex-col items-center justify-center space-y-3 border-b border-neutral-200 px-4 py-8 sm:px-16">
         <div className="flex items-center space-x-3 py-4">
           <img
-            src="/_static/icons/short.svg"
+            src="https://assets.dub.co/misc/icons/short.svg"
             alt="Short.io logo"
             className="h-10 w-10"
           />
-          <ArrowRight className="h-5 w-5 text-gray-600" />
+          <ArrowRight className="h-5 w-5 text-neutral-600" />
           <Logo />
         </div>
         <h3 className="text-lg font-medium">Import Your Short.io Links</h3>
-        <p className="text-center text-sm text-gray-500">
-          Easily import all your existing Short.io links into{" "}
-          {process.env.NEXT_PUBLIC_APP_NAME} with just a few clicks.
+        <p className="text-center text-sm text-neutral-500">
+          Easily import all your existing Short.io links into Dub with just a
+          few clicks.
         </p>
       </div>
 
-      <div className="flex flex-col space-y-6 bg-gray-50 px-4 py-8 text-left sm:px-16">
-        {isLoading ? (
-          <button className="flex flex-col items-center justify-center space-y-4 bg-none">
+      <div className="flex flex-col space-y-6 bg-neutral-50 px-4 py-8 text-left sm:px-16">
+        {isLoading || !workspaceId ? (
+          <div className="flex flex-col items-center justify-center space-y-4 bg-none">
             <LoadingSpinner />
-            <p className="text-sm text-gray-500">Connecting to Short.io</p>
-          </button>
+            <p className="text-sm text-neutral-500">Connecting to Short.io</p>
+          </div>
         ) : domains ? (
-          <form
-            onSubmit={async (e) => {
-              e.preventDefault();
-              setImporting(true);
-              toast.promise(
-                fetch(`/api/workspaces/${id}/import/short`, {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                  },
-                  body: JSON.stringify({
-                    selectedDomains,
-                    importTags,
+          domains.length > 0 ? (
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setImporting(true);
+                toast.promise(
+                  fetch(`/api/workspaces/${workspaceId}/import/short`, {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({
+                      selectedDomains,
+                      importTags,
+                      ...(folderId && { folderId }),
+                    }),
+                  }).then(async (res) => {
+                    if (res.ok) {
+                      await mutate();
+                      router.push(
+                        `/${slug}/links${folderId ? `?folderId=${folderId}` : ""}`,
+                      );
+                    } else {
+                      setImporting(false);
+                      throw new Error();
+                    }
                   }),
-                }).then(async (res) => {
-                  if (res.ok) {
-                    await mutate(`/api/domains?workspaceId=${id}`);
-                    router.push(`/${slug}`);
-                  } else {
-                    setImporting(false);
-                    throw new Error();
-                  }
-                }),
-                {
-                  loading: "Adding links to import queue...",
-                  success:
-                    "Successfully added links to import queue! You can now safely navigate from this tab – we will send you an email when your links have been fully imported.",
-                  error: "Error adding links to import queue",
-                },
-              );
-            }}
-            className="flex flex-col space-y-4"
-          >
-            <div className="flex flex-col space-y-2">
-              <p className="text-sm font-medium text-gray-700">Domains</p>
-              {domains.map(({ id, domain, links }) => (
-                <div className="flex items-center justify-between space-x-2 rounded-md border border-gray-200 bg-white px-4 py-2">
-                  <div>
-                    <p className="font-medium text-gray-800">{domain}</p>
-                    {links > 0 && (
-                      <p className="text-xs text-gray-500">
-                        {nFormatter(links)} links found
-                      </p>
-                    )}
+                  {
+                    loading: "Adding links to import queue...",
+                    success:
+                      "Successfully added links to import queue! You can now safely navigate from this tab – we will send you an email when your links have been fully imported.",
+                    error: "Error adding links to import queue",
+                  },
+                );
+              }}
+              className="flex flex-col space-y-4"
+            >
+              <div className="flex flex-col space-y-2">
+                <p className="text-sm font-medium text-neutral-700">Domains</p>
+                {domains.map(({ id, domain, links }) => (
+                  <div className="flex items-center justify-between space-x-2 rounded-md border border-neutral-200 bg-white px-4 py-2">
+                    <div>
+                      <p className="font-medium text-neutral-800">{domain}</p>
+                      {links > 0 && (
+                        <p className="text-xs text-neutral-500">
+                          {nFormatter(links)} links found
+                        </p>
+                      )}
+                    </div>
+                    <Switch
+                      fn={() => {
+                        const selected = isSelected(domain);
+                        if (selected) {
+                          setSelectedDomains((prev) =>
+                            prev.filter((d) => d.domain !== domain),
+                          );
+                        } else {
+                          setSelectedDomains((prev) => [
+                            ...prev,
+                            {
+                              id,
+                              domain,
+                              links,
+                            },
+                          ]);
+                        }
+                      }}
+                      checked={isSelected(domain)}
+                    />
                   </div>
+                ))}
+                <div className="flex items-center justify-between space-x-2 rounded-md py-1 pl-2 pr-4">
+                  <p className="text-xs text-neutral-500">Import all tags?</p>
                   <Switch
-                    fn={() => {
-                      const selected = isSelected(domain);
-                      if (selected) {
-                        setSelectedDomains((prev) =>
-                          prev.filter((d) => d.domain !== domain),
-                        );
-                      } else {
-                        setSelectedDomains((prev) => [
-                          ...prev,
-                          {
-                            id,
-                            domain,
-                            links,
-                          },
-                        ]);
-                      }
-                    }}
-                    checked={isSelected(domain)}
+                    fn={() => setImportTags(!importTags)}
+                    checked={importTags}
                   />
                 </div>
-              ))}
-              <div className="flex items-center justify-between space-x-2 rounded-md py-1 pl-2 pr-4">
-                <p className="text-xs text-gray-500">Import all tags?</p>
-                <Switch
-                  fn={() => setImportTags(!importTags)}
-                  checked={importTags}
-                />
               </div>
+              <Button
+                text="Confirm import"
+                loading={importing}
+                disabled={selectedDomains.length === 0}
+              />
+            </form>
+          ) : (
+            <div className="flex flex-col items-center justify-center gap-2">
+              <ServerOff className="h-6 w-6 text-neutral-500" />
+              <p className="max-w-md text-center text-sm text-neutral-500">
+                Unfortunately, Short.io has been blocking our servers in
+                production. Please reach out to support and we'll help you
+                import your links.
+              </p>
+              <a
+                href="https://dub.co/support"
+                className={cn(
+                  buttonVariants({ variant: "secondary" }),
+                  "flex h-8 items-center justify-center rounded-md border px-4 text-sm",
+                )}
+              >
+                Contact Support
+              </a>
             </div>
-            <Button
-              text="Confirm import"
-              loading={importing}
-              disabled={selectedDomains.length === 0}
-            />
-          </form>
+          )
         ) : (
           // form to add API key to redis manually
           <form
             onSubmit={async (e) => {
               e.preventDefault();
               setSubmitting(true);
-              fetch(`/api/workspaces/${id}/import/short`, {
+              fetch(`/api/workspaces/${workspaceId}/import/short`, {
                 method: "PUT",
                 headers: {
                   "Content-Type": "application/json",
@@ -211,7 +234,7 @@ function ImportShortModal({
                 }),
               }).then(async (res) => {
                 if (res.ok) {
-                  await mutate(`/api/workspaces/${id}/import/short`);
+                  await mutate();
                   toast.success("Successfully added API key");
                 } else {
                   toast.error("Error adding API key");
@@ -223,17 +246,11 @@ function ImportShortModal({
           >
             <div>
               <div className="flex items-center space-x-2">
-                <h2 className="text-sm font-medium text-gray-900">
+                <h2 className="text-sm font-medium text-neutral-900">
                   Short.io API Key
                 </h2>
                 <InfoTooltip
-                  content={
-                    <SimpleTooltipContent
-                      title={`Your Short.io API Key can be found in your Short.io account under "Integrations & API".`}
-                      cta="Read the guide."
-                      href="https://dub.co/help/article/migrating-from-short"
-                    />
-                  }
+                  content={`Your Short.io API Key can be found in your Short.io account under "Integrations & API". [Read the guide.](https://dub.co/help/article/migrating-from-short)`}
                 />
               </div>
               <input
@@ -244,7 +261,7 @@ function ImportShortModal({
                 placeholder="sk_xxxxxxxxxxxxxxxx"
                 autoComplete="off"
                 required
-                className="mt-1 block w-full appearance-none rounded-md border border-gray-300 px-3 py-2 placeholder-gray-400 shadow-sm focus:border-black focus:outline-none focus:ring-black sm:text-sm"
+                className="mt-1 block w-full appearance-none rounded-md border border-neutral-300 px-3 py-2 placeholder-neutral-400 shadow-sm focus:border-black focus:outline-none focus:ring-black sm:text-sm"
               />
             </div>
             <Button text="Confirm API Key" loading={submitting} />
@@ -256,7 +273,8 @@ function ImportShortModal({
 }
 
 export function useImportShortModal() {
-  const [showImportShortModal, setShowImportShortModal] = useState(false);
+  const [showImportShortModal, setShowImportShortModal] =
+    useImportModalParam("short");
 
   const ImportShortModalCallback = useCallback(() => {
     return (

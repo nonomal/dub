@@ -1,38 +1,114 @@
 "use client";
 
-import { nFormatter, timeAgo } from "@dub/utils";
+import { cn } from "@dub/utils";
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
-import Linkify from "linkify-react";
 import { HelpCircle } from "lucide-react";
 import Link from "next/link";
-import { ReactNode, useState } from "react";
+import { isValidElement, ReactNode, useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
 import { Badge } from "./badge";
+import { Button, ButtonProps, buttonVariants } from "./button";
+import { useScrollProgress } from "./hooks/use-scroll-progress";
+import { PROSE_STYLES } from "./rich-text-area";
 
 export function TooltipProvider({ children }: { children: ReactNode }) {
   return (
-    <TooltipPrimitive.Provider delayDuration={100}>
+    <TooltipPrimitive.Provider delayDuration={150}>
       {children}
     </TooltipPrimitive.Provider>
   );
 }
 
-interface TooltipProps {
-  children: ReactNode;
-  content: ReactNode | string;
-  side?: "top" | "bottom" | "left" | "right";
+const TooltipMarkdown = ({
+  className,
+  children,
+}: {
+  className?: string;
+  children: string;
+}) => {
+  return (
+    <ReactMarkdown
+      className={cn(
+        "prose prose-sm prose-neutral max-w-xs text-pretty px-4 py-2 text-center leading-snug transition-all",
+        "prose-a:cursor-alias prose-a:underline prose-a:decoration-dotted prose-a:underline-offset-2",
+        "prose-code:inline-block prose-code:leading-none",
+        PROSE_STYLES.condensed,
+        className,
+      )}
+      components={{
+        a: ({ node, ...props }) => {
+          if (props.href?.startsWith("/")) {
+            return (
+              <Link href={props.href} onClick={(e) => e.stopPropagation()}>
+                {props.children}
+              </Link>
+            );
+          }
+          return (
+            <a
+              {...props}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+            />
+          );
+        },
+        code: ({ node, ...props }) => (
+          <code {...props} className="rounded-md bg-neutral-100 px-1 py-0.5" />
+        ),
+      }}
+    >
+      {children}
+    </ReactMarkdown>
+  );
+};
+export interface TooltipProps
+  extends Omit<TooltipPrimitive.TooltipContentProps, "content"> {
+  content:
+    | ReactNode
+    | string
+    | ((props: { setOpen: (open: boolean) => void }) => ReactNode);
+  contentClassName?: string;
+  disabled?: boolean;
+  disableHoverableContent?: TooltipPrimitive.TooltipProps["disableHoverableContent"];
+  delayDuration?: TooltipPrimitive.TooltipProps["delayDuration"];
 }
 
-export function Tooltip({ children, content, side = "top" }: TooltipProps) {
+export function Tooltip({
+  children,
+  content,
+  contentClassName,
+  disabled,
+  side = "top",
+  disableHoverableContent,
+  delayDuration = 0,
+  ...rest
+}: TooltipProps) {
   const [open, setOpen] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
 
   return (
-    <TooltipPrimitive.Root open={open} onOpenChange={setOpen}>
+    <TooltipPrimitive.Root
+      open={disabled ? false : open}
+      onOpenChange={setOpen}
+      delayDuration={delayDuration}
+      disableHoverableContent={disableHoverableContent}
+    >
       <TooltipPrimitive.Trigger
         asChild
         onClick={() => {
           setOpen(true);
         }}
-        onBlur={() => {
+        onBlur={(e) => {
+          // Keep the tooltip open when focus moves into its content (e.g. a CTA button).
+          // preventDefault also skips Radix's own close-on-blur handler.
+          if (
+            e.relatedTarget instanceof Node &&
+            contentRef.current?.contains(e.relatedTarget)
+          ) {
+            e.preventDefault();
+            return;
+          }
           setOpen(false);
         }}
       >
@@ -40,14 +116,19 @@ export function Tooltip({ children, content, side = "top" }: TooltipProps) {
       </TooltipPrimitive.Trigger>
       <TooltipPrimitive.Portal>
         <TooltipPrimitive.Content
+          ref={contentRef}
           sideOffset={8}
           side={side}
-          className="animate-slide-up-fade z-[99] items-center overflow-hidden rounded-md border border-gray-200 bg-white shadow-md"
+          className="animate-slide-up-fade border-border-default bg-bg-default pointer-events-auto z-[99] items-center overflow-hidden rounded-xl border shadow-sm"
+          collisionPadding={0}
+          {...rest}
         >
           {typeof content === "string" ? (
-            <span className="block max-w-xs px-4 py-2 text-center text-sm text-gray-700">
+            <TooltipMarkdown className={contentClassName}>
               {content}
-            </span>
+            </TooltipMarkdown>
+          ) : typeof content === "function" ? (
+            content({ setOpen })
           ) : (
             content
           )}
@@ -72,110 +153,35 @@ export function TooltipContent({
 }) {
   return (
     <div className="flex max-w-xs flex-col items-center space-y-3 p-4 text-center">
-      <p className="text-sm text-gray-700">{title}</p>
+      <TooltipMarkdown className="p-0">{title}</TooltipMarkdown>
       {cta &&
         (href ? (
           <Link
             href={href}
-            {...(target ? { target } : {})}
-            className="mt-4 w-full rounded-md border border-black bg-black px-3 py-1.5 text-center text-sm text-white transition-all hover:bg-white hover:text-black"
+            {...(target ? { target, rel: "noopener noreferrer" } : {})}
+            className={cn(
+              buttonVariants({ variant: "primary" }),
+              "flex h-8 w-full items-center justify-center whitespace-nowrap rounded-lg border px-4 text-sm",
+            )}
           >
             {cta}
           </Link>
         ) : onClick ? (
-          <button
-            type="button"
-            className="mt-4 w-full rounded-md border border-black bg-black px-3 py-1.5 text-center text-sm text-white transition-all hover:bg-white hover:text-black"
+          <Button
             onClick={onClick}
-          >
-            {cta}
-          </button>
+            text={cta}
+            variant="primary"
+            className="h-8"
+          />
         ) : null)}
     </div>
   );
 }
 
-export function SimpleTooltipContent({
-  title,
-  cta,
-  href,
-}: {
-  title: string;
-  cta: string;
-  href: string;
-}) {
+export function InfoTooltip(props: Omit<TooltipProps, "children">) {
   return (
-    <div className="max-w-xs px-4 py-2 text-center text-sm text-gray-700">
-      {title}{" "}
-      <a
-        href={href}
-        target="_blank"
-        rel="noopener noreferrer"
-        onClick={(e) => e.stopPropagation()}
-        className="inline-flex text-gray-500 underline underline-offset-4 hover:text-gray-800"
-      >
-        {cta}
-      </a>
-    </div>
-  );
-}
-
-export function LinkifyTooltipContent({ children }: { children: ReactNode }) {
-  return (
-    <div className="block max-w-md whitespace-pre-wrap px-4 py-2 text-center text-sm text-gray-700">
-      <Linkify
-        as="p"
-        options={{
-          target: "_blank",
-          rel: "noopener noreferrer nofollow",
-          className:
-            "underline underline-offset-4 text-gray-400 hover:text-gray-700",
-        }}
-      >
-        {children}
-      </Linkify>
-    </div>
-  );
-}
-
-export function InfoTooltip({ content }: { content: ReactNode | string }) {
-  return (
-    <Tooltip content={content}>
-      <HelpCircle className="h-4 w-4 text-gray-500" />
-    </Tooltip>
-  );
-}
-
-export function NumberTooltip({
-  value,
-  unit = "total clicks",
-  children,
-  lastClicked,
-}: {
-  value?: number | null;
-  unit?: string;
-  children: ReactNode;
-  lastClicked?: Date | null;
-}) {
-  if ((!value || value < 1000) && !lastClicked) {
-    return children;
-  }
-  return (
-    <Tooltip
-      content={
-        <div className="block max-w-xs px-4 py-2 text-center text-sm text-gray-700">
-          <p className="text-sm font-semibold text-gray-700">
-            {nFormatter(value || 0, { full: true })} {unit}
-          </p>
-          {lastClicked && (
-            <p className="mt-1 text-xs text-gray-500" suppressHydrationWarning>
-              Last clicked {timeAgo(lastClicked, { withAgo: true })}
-            </p>
-          )}
-        </div>
-      }
-    >
-      {children}
+    <Tooltip {...props}>
+      <HelpCircle className="h-4 w-4 text-neutral-500" />
     </Tooltip>
   );
 }
@@ -186,11 +192,107 @@ export function BadgeTooltip({ children, content, ...props }: TooltipProps) {
       <div className="flex cursor-pointer items-center">
         <Badge
           variant="gray"
-          className="border-gray-300 transition-all hover:bg-gray-200"
+          className="border-neutral-300 transition-all hover:bg-neutral-200"
         >
           {children}
         </Badge>
       </div>
     </Tooltip>
+  );
+}
+
+export function ButtonTooltip({
+  children,
+  tooltipProps,
+  ...props
+}: {
+  children: ReactNode;
+  tooltipProps: TooltipProps;
+} & ButtonProps) {
+  return (
+    <Tooltip {...tooltipProps}>
+      <button
+        type="button"
+        {...props}
+        className={cn(
+          "flex h-6 w-6 items-center justify-center rounded-md text-neutral-500 transition-colors duration-75 hover:bg-neutral-100 active:bg-neutral-200 disabled:cursor-not-allowed disabled:hover:bg-transparent",
+          props.className,
+        )}
+      >
+        {children}
+      </button>
+    </Tooltip>
+  );
+}
+
+export function DynamicTooltipWrapper({
+  children,
+  tooltipProps,
+}: {
+  children: ReactNode;
+  tooltipProps?: TooltipProps;
+}) {
+  return tooltipProps ? (
+    <Tooltip {...tooltipProps}>
+      {isValidElement(children) ? children : <span>{children}</span>}
+    </Tooltip>
+  ) : (
+    children
+  );
+}
+
+export function ScrollableTooltipContent({
+  children,
+  maxHeight = "240px",
+  className,
+}: {
+  children: ReactNode;
+  maxHeight?: string;
+  className?: string;
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const { scrollProgress, updateScrollProgress } = useScrollProgress(
+    scrollRef,
+    {
+      direction: "vertical",
+    },
+  );
+
+  const [showTopGradient, setShowTopGradient] = useState(false);
+  const [showBottomGradient, setShowBottomGradient] = useState(false);
+
+  useEffect(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+
+    const { scrollHeight, clientHeight } = element;
+    const canScroll = scrollHeight > clientHeight;
+
+    // Show top gradient if not at top and can scroll
+    setShowTopGradient(canScroll && scrollProgress > 0);
+    // Show bottom gradient if not at bottom and can scroll
+    setShowBottomGradient(canScroll && scrollProgress < 1);
+  }, [scrollProgress]);
+
+  return (
+    <div className="relative">
+      {showTopGradient && (
+        <div className="pointer-events-none absolute left-0 right-0 top-0 z-10 h-6 rounded-t-xl bg-gradient-to-b from-white to-transparent" />
+      )}
+      <div
+        ref={scrollRef}
+        onScroll={updateScrollProgress}
+        className={cn(
+          "flex flex-col gap-2 overflow-y-auto px-3 py-2",
+          className,
+        )}
+        style={{ maxHeight }}
+      >
+        {children}
+      </div>
+      {showBottomGradient && (
+        <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-10 h-6 rounded-b-xl bg-gradient-to-t from-white to-transparent" />
+      )}
+    </div>
   );
 }

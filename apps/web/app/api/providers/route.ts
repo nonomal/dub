@@ -1,9 +1,8 @@
 import { handleAndReturnErrorResponse } from "@/lib/api/errors";
-import { ratelimit } from "@/lib/upstash";
-import { getUrlQuerySchema } from "@/lib/zod/schemas";
+import { safeFetch } from "@/lib/api/safe-fetch";
+import { ratelimitOrThrow } from "@/lib/api/utils";
+import { getUrlQuerySchema } from "@/lib/zod/schemas/links";
 import { fetchWithTimeout } from "@dub/utils";
-import { ipAddress } from "@vercel/edge";
-import { getToken } from "next-auth/jwt";
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "edge";
@@ -14,18 +13,7 @@ export async function GET(req: NextRequest) {
       url: req.nextUrl.searchParams.get("url"),
     });
 
-    // Rate limit if user is not logged in
-    const session = await getToken({
-      req,
-      secret: process.env.NEXTAUTH_SECRET,
-    });
-    if (!session?.email) {
-      const ip = ipAddress(req);
-      const { success } = await ratelimit().limit(`providers:${ip}`);
-      if (!success) {
-        return new Response("Don't DDoS me pls 🥺", { status: 429 });
-      }
-    }
+    await ratelimitOrThrow(req, "providers");
 
     const urlObject = new URL(url);
 
@@ -54,9 +42,11 @@ export async function GET(req: NextRequest) {
 
     urlObject.pathname = "/xyz";
 
-    const headers = await fetchWithTimeout(urlObject.toString(), {
-      redirect: "manual",
-    })
+    const headers = await safeFetch(
+      urlObject.toString(),
+      { method: "HEAD" },
+      { maxRedirects: 0 },
+    )
       .then((r) => ({
         engine: r.headers.get("engine"),
         poweredBy: r.headers.get("x-powered-by"),
@@ -74,7 +64,7 @@ export async function GET(req: NextRequest) {
           provider: "short",
         });
       }
-      if (headers.poweredBy?.includes("Dub.co")) {
+      if (headers.poweredBy?.includes("Dub")) {
         return NextResponse.json({
           provider: "dub",
         });

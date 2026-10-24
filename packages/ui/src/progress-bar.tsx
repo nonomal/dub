@@ -1,7 +1,7 @@
 "use client";
 
 import { cn } from "@dub/utils";
-import { motion } from "framer-motion";
+import { motion } from "motion/react";
 
 export function ProgressBar({
   value = 0,
@@ -15,7 +15,7 @@ export function ProgressBar({
   return (
     <div
       className={cn(
-        "h-3 w-full overflow-hidden rounded-full bg-gray-200",
+        "h-3 w-full overflow-hidden rounded-full bg-neutral-200",
         className,
       )}
     >

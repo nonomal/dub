@@ -1,8 +1,21 @@
-import { DeviceTabs } from "@/lib/analytics";
-import { Apple, Chrome, Safari } from "@/ui/shared/icons/devices";
+import { DeviceTabs } from "@/lib/analytics/types";
+import { Chrome, Safari } from "@/ui/shared/icons/devices";
 import { BlurImage } from "@dub/ui";
+import {
+  AppleLogo,
+  Cube,
+  Desktop,
+  GamingConsole,
+  MobilePhone,
+  TV,
+  Tablet,
+  Watch,
+  Window,
+} from "@dub/ui/icons";
+import { cn } from "@dub/utils";
+import { TRIGGER_DISPLAY } from "./trigger-display";
 
-export default function DeviceIcon({
+export function DeviceIcon({
   display,
   tab,
   className,
@@ -11,61 +24,74 @@ export default function DeviceIcon({
   tab: DeviceTabs;
   className: string;
 }) {
-  if (tab === "device") {
-    return (
-      <BlurImage
-        src={
-          display === "Desktop"
-            ? `https://faisalman.github.io/ua-parser-js/images/types/default.png`
-            : `https://faisalman.github.io/ua-parser-js/images/types/${display.toLowerCase()}.png`
-        }
-        alt={display}
-        width={20}
-        height={20}
-        sizes="10vw"
-        className={className}
-      />
-    );
-  } else if (tab === "browser") {
-    if (display === "Chrome") {
-      return <Chrome className={className} />;
-    } else if (display === "Safari" || display === "Mobile Safari") {
-      return <Safari className={className} />;
-    } else {
-      return (
-        <BlurImage
-          src={`https://faisalman.github.io/ua-parser-js/images/browsers/${display.toLowerCase()}.png`}
-          alt={display}
-          width={20}
-          height={20}
-          className={className}
-        />
-      );
+  if (tab === "devices") {
+    switch (display) {
+      case "Desktop":
+        return <Desktop className={className} />;
+      case "Mobile":
+        return <MobilePhone className={className} />;
+      case "Tablet":
+        return <Tablet className={className} />;
+      case "Wearable":
+        return <Watch className={className} />;
+      case "Console":
+        return <GamingConsole className={className} />;
+      case "Smarttv":
+        return <TV className={className} />;
+      default:
+        return <Desktop className={className} />;
+    }
+  } else if (tab === "browsers") {
+    switch (display) {
+      case "Chrome":
+        return <Chrome className={className} />;
+      case "Safari":
+      case "Mobile Safari":
+        return <Safari className={className} />;
+      case "Unknown":
+        return <Window className={className} />;
+      default:
+        return (
+          <BlurImage
+            src={`https://faisalman.github.io/ua-parser-js/images/browsers/${display.toLowerCase()}.png`}
+            alt={display}
+            width={20}
+            height={20}
+            // Non-square sources (e.g. Facebook/Instagram at 3:2) squash without this
+            className={cn(className, "object-cover")}
+          />
+        );
     }
   } else if (tab === "os") {
-    if (display === "Mac OS") {
-      return (
-        <BlurImage
-          src="/_static/icons/macos.png"
-          alt={display}
-          width={20}
-          height={20}
-          className="h-4 w-4"
-        />
-      );
-    } else if (display === "iOS") {
-      return <Apple className="-ml-1 h-5 w-5" />;
-    } else {
-      return (
-        <BlurImage
-          src={`https://faisalman.github.io/ua-parser-js/images/os/${display.toLowerCase()}.png`}
-          alt={display}
-          width={30}
-          height={20}
-          className="h-4 w-5"
-        />
-      );
+    switch (display) {
+      case "Mac OS":
+        return (
+          <BlurImage
+            src="https://assets.dub.co/misc/icons/macos.png"
+            alt={display}
+            width={20}
+            height={20}
+            className="h-4 w-4"
+          />
+        );
+      case "iOS":
+        return <AppleLogo className="-ml-1 h-5 w-5" />;
+      case "Unknown":
+        return <Cube className={className} />;
+      default:
+        return (
+          <BlurImage
+            src={`https://faisalman.github.io/ua-parser-js/images/os/${display.toLowerCase()}.png`}
+            alt={display}
+            width={30}
+            height={20}
+            className="h-4 w-5"
+          />
+        );
     }
+  } else if (tab === "triggers") {
+    const { icon: Icon } = TRIGGER_DISPLAY[display ?? "link"];
+    return <Icon className={className} />;
   } else {
     return (
       <BlurImage

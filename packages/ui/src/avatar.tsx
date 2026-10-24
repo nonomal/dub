@@ -1,48 +1,66 @@
-import { cn } from "@dub/utils";
+import { cn, getAvatarTheme } from "@dub/utils";
+
+const headStyle = {
+  backgroundImage:
+    "linear-gradient(135deg, rgba(255,255,255,0) 0%, rgba(0,0,0,0.2) 100%)",
+  boxShadow:
+    "inset 6px -5px 11px rgba(0,0,0,0.13), inset -18px -12px 19px rgba(255,255,255,0.4)",
+};
+
+const shouldersStyle = {
+  backgroundImage:
+    "linear-gradient(135deg, rgba(255,255,255,0) 0%, rgba(0,0,0,0.2) 100%)",
+  boxShadow:
+    "inset 10px -12px 19px rgba(0,0,0,0.4), inset -18px -12px 19px rgba(255,255,255,0.4), inset 2px -1px 11px rgba(0,0,0,0.1)",
+};
 
 export function Avatar({
-  user = {},
+  imageUrl,
+  identifier,
   className,
 }: {
-  user?: {
-    name?: string | null | undefined;
-    email?: string | null | undefined;
-    image?: string | null | undefined;
-  };
+  imageUrl?: string | null;
+  identifier: string;
   className?: string;
 }) {
-  if (!user) {
+  if (imageUrl) {
     return (
-      <div
-        className={cn(
-          "h-10 w-10 animate-pulse rounded-full border border-gray-300 bg-gray-100",
-          className,
-        )}
+      <img
+        src={imageUrl}
+        alt={identifier}
+        className={cn("shrink-0 rounded-full", className)}
       />
     );
   }
 
-  return (
-    <img
-      alt={`Avatar for ${user?.name || user?.email}`}
-      referrerPolicy="no-referrer"
-      src={
-        user?.image ||
-        `https://api.dicebear.com/7.x/micah/svg?seed=${user?.email}`
-      }
-      className={cn("h-10 w-10 rounded-full border border-gray-300", className)}
-      draggable={false}
-    />
-  );
-}
+  const theme = getAvatarTheme(identifier);
 
-export function TokenAvatar({ id }: { id: string }) {
   return (
-    <img
-      src={`https://api.dicebear.com/7.x/shapes/svg?seed=${id}`}
-      alt="avatar"
-      className="h-10 w-10 rounded-full"
-      draggable={false}
-    />
+    <div
+      className={cn(
+        "relative shrink-0 overflow-hidden rounded-full",
+        className,
+      )}
+      style={{ background: theme.bg }}
+      role="img"
+      aria-label={identifier}
+    >
+      <div className="absolute left-0 top-0 h-full w-full">
+        <div
+          className="absolute left-[30%] top-[22%] aspect-square w-[40%] rounded-full"
+          style={{
+            backgroundColor: theme.fg,
+            ...headStyle,
+          }}
+        />
+        <div
+          className="absolute left-[10%] top-[70%] h-[40%] w-[80%] rounded-t-full"
+          style={{
+            backgroundColor: theme.fg,
+            ...shouldersStyle,
+          }}
+        />
+      </div>
+    </div>
   );
 }

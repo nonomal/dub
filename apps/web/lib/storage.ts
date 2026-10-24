@@ -1,11 +1,18 @@
-import { fetchWithTimeout } from "@dub/utils";
+import { isPrivateIp } from "@/lib/api/is-private-ip";
+import { assertSafeStorageKey } from "@/lib/storage/assert-safe-storage-key";
+import { OG_AVATAR_URL, R2_URL, fetchWithTimeout } from "@dub/utils";
 import { AwsClient } from "aws4fetch";
+import { promises as dns } from "dns";
+import { isIP } from "net";
 
 interface imageOptions {
   contentType?: string;
   width?: number;
   height?: number;
+  headers?: Record<string, string>;
 }
+
+type BucketType = "public" | "private";
 
 class StorageClient {
   private client: AwsClient;
@@ -19,7 +26,17 @@ class StorageClient {
     });
   }
 
-  async upload(key: string, body: Blob | Buffer | string, opts?: imageOptions) {
+  async upload({
+    key,
+    body,
+    opts,
+    bucket = "public",
+  }: {
+    key: string;
+    body: Blob | Buffer | string;
+    opts?: imageOptions;
+    bucket?: BucketType;
+  }) {
     let uploadBody;
     if (typeof body === "string") {
       if (this.isBase64(body)) {
@@ -34,31 +51,195 @@ class StorageClient {
     }
 
     const headers = {
-      "Content-Length": uploadBody.size.toString(),
+      "Content-Length": String(
+        uploadBody instanceof Blob ? uploadBody.size : uploadBody.byteLength,
+      ),
+      ...opts?.headers,
     };
-    if (opts?.contentType) headers["Content-Type"] = opts.contentType;
+
+    if (opts?.contentType) {
+      headers["Content-Type"] = opts.contentType;
+    }
+
+    const requestUrl = this.objectRequestUrl(key, bucket);
 
     try {
-      await this.client.fetch(`${process.env.STORAGE_ENDPOINT}/${key}`, {
+      const response = await this.client.fetch(requestUrl, {
         method: "PUT",
         headers,
         body: uploadBody,
       });
 
+      if (!response.ok) {
+        throw new Error(response.statusText);
+      }
+
       return {
-        url: `${process.env.STORAGE_BASE_URL}/${key}`,
+        url: `${R2_URL}/${key}`,
       };
     } catch (error) {
-      throw new Error(`Failed to upload file: ${error.message}`);
+      console.error("storage.upload failed", error);
+      throw new Error("Failed to upload file. Please try again later.");
     }
   }
 
-  async delete(key: string) {
-    await this.client.fetch(`${process.env.STORAGE_ENDPOINT}/${key}`, {
-      method: "DELETE",
-    });
+  async delete({
+    key,
+    bucket = "public",
+  }: {
+    key: string;
+    bucket?: BucketType;
+  }) {
+    const requestUrl = this.objectRequestUrl(key, bucket);
 
-    return { success: true };
+    try {
+      const response = await this.client.fetch(requestUrl, {
+        method: "DELETE",
+      });
+
+      if (!response.ok) {
+        throw new Error(response.statusText);
+      }
+    } catch (error) {
+      console.error("storage.delete failed", error);
+      throw new Error("Failed to delete file. Please try again later.");
+    }
+  }
+
+  // Fetch object metadata (Content-Type, size, eTag) without downloading the body
+  async head({ key, bucket = "public" }: { key: string; bucket?: BucketType }) {
+    const response = await this.client.fetch(
+      this.objectRequestUrl(key, bucket),
+      {
+        method: "HEAD",
+      },
+    );
+
+    if (response.status === 404) {
+      return null;
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        `storage.head failed (${response.status}): ${response.statusText}`,
+      );
+    }
+
+    const contentLengthHeader = response.headers.get("content-length");
+
+    return {
+      contentType: response.headers.get("content-type"),
+      contentLength: contentLengthHeader
+        ? Number.parseInt(contentLengthHeader, 10)
+        : null,
+      eTag: response.headers.get("etag"),
+    };
+  }
+
+  // Read the first N bytes of an object (for magic-byte sniffing)
+  async getBytes({
+    key,
+    bucket = "public",
+    length = 4100,
+  }: {
+    key: string;
+    bucket?: BucketType;
+    length?: number;
+  }) {
+    const response = await this.client.fetch(
+      this.objectRequestUrl(key, bucket),
+      {
+        method: "GET",
+        headers: {
+          Range: `bytes=0-${Math.max(length - 1, 0)}`,
+        },
+      },
+    );
+
+    if (response.status === 404) {
+      return null;
+    }
+
+    if (!response.ok && response.status !== 206) {
+      throw new Error(
+        `storage.getBytes failed (${response.status}): ${response.statusText}`,
+      );
+    }
+
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
+  async getSignedUrl({
+    key,
+    method,
+    expiresIn,
+    bucket,
+    headers,
+  }: {
+    key: string;
+    method: "PUT" | "GET";
+    bucket: BucketType;
+    expiresIn: number;
+    headers?: Record<string, string>;
+  }) {
+    const url = new URL(this.objectRequestUrl(key, bucket));
+
+    url.searchParams.set("X-Amz-Expires", String(expiresIn));
+
+    try {
+      const response = await this.client.sign(url, {
+        method,
+        headers,
+        aws: {
+          signQuery: true,
+          allHeaders: true,
+        },
+      });
+
+      return response.url;
+    } catch (error) {
+      console.error("storage.getSignedUrl failed", error);
+      throw new Error("Failed to generate signed url. Please try again later.");
+    }
+  }
+
+  async getSignedUploadUrl(opts: {
+    key: string;
+    bucket?: BucketType;
+    expiresIn?: number;
+    contentLength?: number;
+    contentType?: string;
+  }) {
+    const headers: Record<string, string> = {};
+
+    if (opts.contentLength) {
+      headers["Content-Length"] = String(opts.contentLength);
+    }
+
+    if (opts.contentType) {
+      headers["Content-Type"] = opts.contentType;
+    }
+
+    return await this.getSignedUrl({
+      key: opts.key,
+      method: "PUT",
+      bucket: opts.bucket || "public",
+      expiresIn: opts.expiresIn || 600,
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
+    });
+  }
+
+  async getSignedDownloadUrl(opts: {
+    key: string;
+    bucket?: BucketType;
+    expiresIn?: number;
+  }) {
+    return await this.getSignedUrl({
+      key: opts.key,
+      method: "GET",
+      bucket: opts.bucket || "private",
+      expiresIn: opts.expiresIn || 600,
+    });
   }
 
   private base64ToArrayBuffer(base64: string, opts?: imageOptions) {
@@ -78,9 +259,14 @@ class StorageClient {
     return new Blob([byteArray], blobProps);
   }
 
-  private isBase64(str: string): boolean {
-    const regex = /^data:([a-zA-Z0-9]+\/[a-zA-Z0-9-.+]+);base64,([^\s]*)$/;
-    return regex.test(str);
+  private isBase64(str: string) {
+    const base64Regex =
+      /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+    const dataImageRegex =
+      /^data:image\/[a-zA-Z0-9.+-]+;base64,(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+    return base64Regex.test(str) || dataImageRegex.test(str);
   }
 
   private isUrl(str: string): boolean {
@@ -90,6 +276,63 @@ class StorageClient {
     } catch (_) {
       return false;
     }
+  }
+
+  // Uses the same deny-list as `safeFetch` in `lib/api/safe-fetch.ts`.
+  private async assertSafeUrl(url: string): Promise<void> {
+    const { hostname, protocol } = new URL(url);
+
+    if (protocol !== "http:" && protocol !== "https:") {
+      throw new Error("Only http and https URLs are allowed.");
+    }
+
+    let address: string;
+    if (isIP(hostname) !== 0) {
+      address = hostname;
+    } else {
+      const result = await dns.lookup(hostname);
+      address = result.address;
+    }
+
+    if (isPrivateIp(address)) {
+      throw new Error("URL resolves to a private or internal IP address.");
+    }
+  }
+
+  private async safeFetch(url: string): Promise<Response> {
+    const maxRedirects = 5;
+    let currentUrl = url;
+
+    for (
+      let redirectCount = 0;
+      redirectCount <= maxRedirects;
+      redirectCount++
+    ) {
+      await this.assertSafeUrl(currentUrl);
+
+      const response = await fetchWithTimeout(currentUrl, {
+        redirect: "manual",
+      });
+
+      if (response.ok) {
+        return response;
+      }
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        if (!location) {
+          throw new Error("Redirect response missing location header");
+        }
+        currentUrl = new URL(location, currentUrl).href;
+        continue;
+      }
+
+      throw new Error(
+        `Failed to fetch URL: ${response.status} ${response.statusText}`,
+      );
+    }
+
+    throw new Error("Too many redirects");
   }
 
   private async urlToBlob(url: string, opts?: imageOptions): Promise<Blob> {
@@ -103,10 +346,10 @@ class StorageClient {
         proxyUrl.searchParams.set("fit", "cover");
         response = await fetchWithTimeout(proxyUrl.toString());
       } catch (error) {
-        response = await fetch(url);
+        response = await this.safeFetch(url);
       }
     } else {
-      response = await fetch(url);
+      response = await this.safeFetch(url);
     }
     if (!response.ok) {
       throw new Error(`Failed to fetch URL: ${response.statusText}`);
@@ -117,10 +360,44 @@ class StorageClient {
     }
     return blob;
   }
+
+  private objectRequestUrl(key: string, bucket: BucketType) {
+    assertSafeStorageKey(key);
+
+    return `${process.env.STORAGE_ENDPOINT}/${this._getBucketName(bucket)}/${key}`;
+  }
+
+  private _getBucketName(bucket: BucketType) {
+    if (bucket === "public") {
+      const bucketName = process.env.STORAGE_PUBLIC_BUCKET;
+
+      if (!bucketName) {
+        throw new Error("STORAGE_PUBLIC_BUCKET is not set");
+      }
+
+      return bucketName;
+    }
+
+    if (bucket === "private") {
+      const bucketName = process.env.STORAGE_PRIVATE_BUCKET;
+
+      if (!bucketName) {
+        throw new Error("STORAGE_PRIVATE_BUCKET is not set");
+      }
+
+      return bucketName;
+    }
+
+    throw new Error(`Invalid bucket type: ${bucket}`);
+  }
 }
 
 export const storage = new StorageClient();
 
 export const isStored = (url: string) => {
-  return url.startsWith(process.env.STORAGE_BASE_URL || "");
+  return url.startsWith(R2_URL) || url.startsWith(OG_AVATAR_URL);
+};
+
+export const isNotHostedImage = (imageString: string) => {
+  return !imageString.startsWith("https://");
 };

@@ -1,6 +1,9 @@
+import { clientAccessCheck } from "@/lib/client-access-check";
+import { mutatePrefix } from "@/lib/swr/mutate";
 import useTags from "@/lib/swr/use-tags";
 import useWorkspace from "@/lib/swr/use-workspace";
-import { TagColorProps, TagProps } from "@/lib/types";
+import { ResourceColorsEnum, TagProps } from "@/lib/types";
+import { TAG_COLORS_DATA } from "@/ui/colors";
 import {
   Button,
   InfoTooltip,
@@ -10,11 +13,10 @@ import {
   RadioGroup,
   RadioGroupItem,
   TooltipContent,
+  useKeyboardShortcut,
   useMediaQuery,
-  useRouterStuff,
 } from "@dub/ui";
-import { capitalize, cn } from "@dub/utils";
-import va from "@vercel/analytics";
+import { capitalize, cn, pluralize } from "@dub/utils";
 import {
   Dispatch,
   FormEvent,
@@ -24,8 +26,7 @@ import {
   useState,
 } from "react";
 import { toast } from "sonner";
-import { mutate } from "swr";
-import { COLORS_LIST, randomBadgeColor } from "../links/tag-badge";
+import { randomBadgeColor } from "../links/tag-badge";
 
 function AddEditTagModal({
   showAddEditTagModal,
@@ -64,7 +65,7 @@ function AddEditTagModal({
     () =>
       id
         ? {
-            method: "PUT",
+            method: "PATCH",
             url: `/api/tags/${id}?workspaceId=${workspaceId}`,
             successMessage: "Successfully updated tag!",
           }
@@ -81,17 +82,19 @@ function AddEditTagModal({
       showModal={showAddEditTagModal}
       setShowModal={setShowAddEditTagModal}
     >
-      <div className="flex flex-col items-center justify-center space-y-3 border-b border-gray-200 px-4 py-4 pt-8 sm:px-16">
+      <div className="flex flex-col items-center justify-center space-y-3 border-b border-neutral-200 px-4 py-4 pt-8 sm:px-16">
         <Logo />
         <div className="flex flex-col space-y-1 text-center">
-          <h3 className="text-lg font-medium">{props ? "Edit" : "Add"} tag</h3>
-          <p className="text-sm text-gray-500">
+          <h3 className="text-lg font-medium">
+            {props ? "Edit" : "Create"} tag
+          </h3>
+          <p className="text-sm text-neutral-500">
             Use tags to organize your links.{" "}
             <a
               href="https://dub.co/help/article/how-to-use-tags#what-is-a-tag"
               target="_blank"
               rel="noopener noreferrer"
-              className="underline underline-offset-4 hover:text-gray-800"
+              className="underline underline-offset-4 hover:text-neutral-800"
             >
               Learn more
             </a>
@@ -116,18 +119,7 @@ function AddEditTagModal({
             }),
           }).then(async (res) => {
             if (res.status === 200 || res.status === 201) {
-              va.track(props ? "Edited Tag" : "Created Tag");
-              await Promise.all([
-                mutate(`/api/tags?workspaceId=${workspaceId}`),
-                props
-                  ? mutate(
-                      (key) =>
-                        typeof key === "string" && key.startsWith("/api/links"),
-                      undefined,
-                      { revalidate: true },
-                    )
-                  : null,
-              ]);
+              await mutatePrefix(["/api/tags", "/api/links"]);
               toast.success(endpoint.successMessage);
               setShowAddEditTagModal(false);
             } else {
@@ -137,11 +129,13 @@ function AddEditTagModal({
             setSaving(false);
           });
         }}
-        className="flex flex-col space-y-6 bg-gray-50 px-4 py-8 text-left sm:rounded-b-2xl sm:px-16"
+        className="flex flex-col space-y-6 bg-neutral-50 px-4 py-8 text-left sm:rounded-b-2xl sm:px-16"
       >
         <div>
           <label htmlFor="name" className="flex items-center space-x-2">
-            <p className="block text-sm font-medium text-gray-700">Tag Name</p>
+            <p className="block text-sm font-medium text-neutral-700">
+              Tag Name
+            </p>
           </label>
           <div className="mt-2 flex rounded-md shadow-sm">
             <input
@@ -151,7 +145,7 @@ function AddEditTagModal({
               required
               autoFocus={!isMobile}
               autoComplete="off"
-              className="block w-full rounded-md border-gray-300 text-gray-900 placeholder-gray-400 focus:border-gray-500 focus:outline-none focus:ring-gray-500 sm:text-sm"
+              className="block w-full rounded-md border-neutral-300 text-neutral-900 placeholder-neutral-400 focus:border-neutral-500 focus:outline-none focus:ring-neutral-500 sm:text-sm"
               placeholder="New Tag"
               value={name}
               onChange={(e) => {
@@ -163,17 +157,19 @@ function AddEditTagModal({
 
         <div>
           <label htmlFor="name" className="flex items-center space-x-2">
-            <p className="block text-sm font-medium text-gray-700">Tag Color</p>
-            <InfoTooltip content={`A color to make your tag stand out.`} />
+            <p className="block text-sm font-medium text-neutral-700">
+              Tag Color
+            </p>
+            <InfoTooltip content="A color to make your tag stand out." />
           </label>
           <RadioGroup
             defaultValue={color}
-            onValueChange={(value: TagColorProps) => {
+            onValueChange={(value: ResourceColorsEnum) => {
               setData({ ...data, color: value });
             }}
             className="mt-2 flex flex-wrap gap-3"
           >
-            {COLORS_LIST.map(({ color: colorOption, css }) => (
+            {TAG_COLORS_DATA.map(({ color: colorOption, tagVariants }) => (
               <div key={colorOption} className="flex items-center">
                 <RadioGroupItem
                   value={colorOption}
@@ -184,7 +180,7 @@ function AddEditTagModal({
                   htmlFor={colorOption}
                   className={cn(
                     "cursor-pointer whitespace-nowrap rounded-md px-2 py-0.5 text-sm capitalize ring-current peer-focus-visible:ring-offset-2",
-                    css,
+                    tagVariants,
                     color === colorOption && "ring-2",
                   )}
                 >
@@ -210,33 +206,36 @@ function AddTagButton({
 }: {
   setShowAddEditTagModal: Dispatch<SetStateAction<boolean>>;
 }) {
-  const { plan, nextPlan, tagsLimit } = useWorkspace();
+  const { slug, plan, tagsLimit, role } = useWorkspace();
   const { tags } = useTags();
-  const { queryParams } = useRouterStuff();
   const exceededTags = tags && tagsLimit && tags.length >= tagsLimit;
+
+  const permissionsError = clientAccessCheck({
+    action: "tags.write",
+    role,
+  }).error;
+
+  useKeyboardShortcut("c", () => setShowAddEditTagModal(true), {
+    enabled: !exceededTags && !permissionsError,
+  });
 
   return (
     <div>
       <Button
-        variant="secondary"
-        text="Add"
-        className="h-7 px-2"
+        variant="primary"
+        text="Create tag"
+        shortcut="C"
+        className="h-9 rounded-lg"
         disabledTooltip={
           exceededTags ? (
             <TooltipContent
-              title={`You can only add up to ${tagsLimit} tag${
-                tagsLimit === 1 ? "" : "s"
-              } on the ${capitalize(plan)} plan. Upgrade to add more tags`}
+              title={`You can only add up to ${tagsLimit} ${pluralize("tag", tagsLimit || 0)} on the ${capitalize(plan)} plan. Upgrade to add more tags`}
               cta="Upgrade"
-              onClick={() => {
-                queryParams({
-                  set: {
-                    upgrade: nextPlan.name.toLowerCase(),
-                  },
-                });
-              }}
+              href={`/${slug}/upgrade`}
             />
-          ) : undefined
+          ) : (
+            permissionsError || undefined
+          )
         }
         onClick={() => setShowAddEditTagModal(true)}
       />

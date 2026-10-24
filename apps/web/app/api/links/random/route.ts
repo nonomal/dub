@@ -1,13 +1,9 @@
-import { DubApiError, handleAndReturnErrorResponse } from "@/lib/api/errors";
+import { handleAndReturnErrorResponse } from "@/lib/api/errors";
+import { ratelimitOrThrow } from "@/lib/api/utils";
 import { getRandomKey } from "@/lib/planetscale";
-import { ratelimit } from "@/lib/upstash";
-import { domainKeySchema } from "@/lib/zod/schemas";
+import { domainKeySchema } from "@/lib/zod/schemas/links";
 import { getSearchParams } from "@dub/utils";
-import { ipAddress } from "@vercel/edge";
-import { getToken } from "next-auth/jwt";
 import { NextRequest, NextResponse } from "next/server";
-
-export const runtime = "edge";
 
 // GET /api/links/random – get a random available link key for a given domain
 export const GET = async (req: NextRequest) => {
@@ -17,26 +13,9 @@ export const GET = async (req: NextRequest) => {
       .pick({ domain: true })
       .parse(searchParams);
 
-    // Rate limit if user is not logged in
-    const session = await getToken({
-      req,
-      secret: process.env.NEXTAUTH_SECRET,
-    });
-    if (!session?.email) {
-      const ip = ipAddress(req);
-      const { success } = await ratelimit().limit(`links-random:${ip}`);
-      if (!success) {
-        throw new DubApiError({
-          code: "rate_limit_exceeded",
-          message: "Don't DDoS me pls 🥺",
-        });
-      }
-    }
+    await ratelimitOrThrow(req, "links-random");
 
-    const response = await getRandomKey({
-      domain,
-      long: domain === "loooooooo.ng",
-    });
+    const response = await getRandomKey({ domain });
     return NextResponse.json(response);
   } catch (error) {
     return handleAndReturnErrorResponse(error);

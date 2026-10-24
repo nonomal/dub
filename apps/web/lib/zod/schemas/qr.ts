@@ -1,20 +1,15 @@
-import {
-  DEFAULT_BGCOLOR,
-  DEFAULT_FGCOLOR,
-  DEFAULT_INCLUDEMARGIN,
-  QR_LEVELS,
-} from "@/lib/qr/constants";
-import z from "@/lib/zod";
+import { DEFAULT_FGCOLOR, DEFAULT_MARGIN, QR_LEVELS } from "@/lib/qr/constants";
+import * as z from "zod/v4";
 import { booleanQuerySchema } from "./misc";
+import { parseUrlSchema } from "./utils";
 
 export const getQRCodeQuerySchema = z.object({
-  url: z
+  url: parseUrlSchema.describe("The URL to generate a QR code for."),
+  logo: z
     .string()
-    .url()
     .optional()
-    .default("https://dub.co")
     .describe(
-      "The URL to generate a QR code for. Defaults to `https://dub.co` if not provided.",
+      "The logo to include in the QR code. Can only be used with a paid plan on Dub.",
     ),
   size: z.coerce
     .number()
@@ -40,14 +35,32 @@ export const getQRCodeQuerySchema = z.object({
   bgColor: z
     .string()
     .optional()
-    .default(DEFAULT_BGCOLOR)
     .describe(
-      "The background color of the QR code in hex format. Defaults to `#ffffff` if not provided.",
+      "The background color of the QR code in hex format. Defaults to `#ffffff` for `png`. When omitted for `svg`, the background is transparent.",
+    ),
+  hideLogo: booleanQuerySchema
+    .optional()
+    .default(false)
+    .describe(
+      "Whether to hide the logo in the QR code. Can only be used with a paid plan on Dub.",
+    ),
+  margin: z.coerce
+    .number()
+    .optional()
+    .default(DEFAULT_MARGIN)
+    .describe(
+      `The size of the margin around the QR code. Defaults to ${DEFAULT_MARGIN} if not provided.`,
     ),
   includeMargin: booleanQuerySchema
     .optional()
-    .default(`${DEFAULT_INCLUDEMARGIN}`)
+    .default(true)
     .describe(
-      "Whether to include a margin around the QR code. Defaults to `false` if not provided.",
-    ),
+      "DEPRECATED: Margin is included by default. Use the `margin` prop to customize the margin size.",
+    )
+    .meta({ deprecated: true }),
+  format: z
+    .enum(["png", "svg"])
+    .optional()
+    .default("png")
+    .describe("The format of the QR code. Defaults to `png` if not provided."),
 });

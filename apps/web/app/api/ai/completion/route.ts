@@ -1,57 +1,59 @@
-import { anthropic } from "@/lib/anthropic";
-import { DubApiError, handleAndReturnErrorResponse } from "@/lib/api/errors";
-import { ratelimit } from "@/lib/upstash";
-import { ipAddress } from "@vercel/edge";
-import { AnthropicStream, StreamingTextResponse } from "ai";
-import { getToken } from "next-auth/jwt";
-import { NextRequest } from "next/server";
+import { handleAndReturnErrorResponse } from "@/lib/api/errors";
+import { throwIfAIUsageExceeded } from "@/lib/api/links/usage-checks";
+import { normalizeWorkspaceId } from "@/lib/api/workspaces/workspace-id";
+import { withWorkspace } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
+import { anthropic } from "@ai-sdk/anthropic";
+import { waitUntil } from "@vercel/functions";
+import { streamText } from "ai";
+import * as z from "zod/v4";
 
-export const runtime = "edge";
+const completionSchema = z.object({
+  prompt: z.string(),
+  model: z
+    .enum(["claude-haiku-4-5", "claude-sonnet-4-6"])
+    .optional()
+    .default("claude-sonnet-4-6"),
+});
 
-export async function POST(req: NextRequest) {
+// POST /api/ai/completion – Generate AI completion
+export const POST = withWorkspace(async ({ req, workspace }) => {
   try {
-    const session = await getToken({
-      req,
-      secret: process.env.NEXTAUTH_SECRET,
-    });
-    if (!session?.email) {
-      throw new DubApiError({
-        code: "unauthorized",
-        message: "You must be logged in to access this resource",
-      });
-    }
+    const {
+      // comment for better diff
+      prompt,
+      model,
+    } = completionSchema.parse(await req.json());
 
-    const ip = ipAddress(req);
-    const { success } = await ratelimit(5, "1 m").limit(`ai-completion:${ip}`);
-    if (!success) {
-      throw new DubApiError({
-        code: "rate_limit_exceeded",
-        message: "Don't DDoS me pls 🥺",
-      });
-    }
+    throwIfAIUsageExceeded(workspace);
 
-    // Extract the `prompt` from the body of the request
-    const { prompt } = await req.json();
-
-    // Ask Claude for a streaming chat completion given the prompt
-    const response = await anthropic.messages.create({
+    const result = streamText({
+      model: anthropic(model),
       messages: [
         {
           role: "user",
           content: prompt,
         },
       ],
-      model: "claude-3-sonnet-20240229",
-      stream: true,
-      max_tokens: 300,
+      maxOutputTokens: 300,
     });
 
-    // Convert the response into a friendly text-stream
-    const stream = AnthropicStream(response);
+    // only count usage for the sonnet model
+    if (model === "claude-sonnet-4-6") {
+      waitUntil(
+        prisma.project.update({
+          where: { id: normalizeWorkspaceId(workspace.id) },
+          data: {
+            aiUsage: {
+              increment: 1,
+            },
+          },
+        }),
+      );
+    }
 
-    // Respond with the stream
-    return new StreamingTextResponse(stream);
+    return result.toTextStreamResponse();
   } catch (error) {
     return handleAndReturnErrorResponse(error);
   }
-}
+});

@@ -1,50 +1,53 @@
-import { useRouterStuff } from "@dub/ui";
+import { useCurrentSubdomain, useRouterStuff } from "@dub/ui";
 import { fetcher } from "@dub/utils";
-import { useEffect, useState } from "react";
 import useSWR from "swr";
+import * as z from "zod/v4";
+import { getLinksCountQuerySchema } from "../zod/schemas/links";
 import useWorkspace from "./use-workspace";
 
-export default function useLinksCount({
-  groupBy,
-}: {
-  groupBy?: "domain" | "tagId";
-} = {}) {
-  const { id } = useWorkspace();
-  const { getQueryString } = useRouterStuff();
+const partialQuerySchema = getLinksCountQuerySchema.partial();
 
-  const [admin, setAdmin] = useState(false);
-  useEffect(() => {
-    if (window.location.host.startsWith("admin.")) {
-      setAdmin(true);
-    }
-  }, []);
+export default function useLinksCount<T = any>({
+  query,
+  ignoreParams,
+  enabled = true,
+}: {
+  query?: z.infer<typeof partialQuerySchema>;
+  ignoreParams?: boolean;
+  enabled?: boolean;
+} = {}) {
+  const { id: workspaceId, isMegaWorkspace } = useWorkspace();
+  const { getQueryString } = useRouterStuff();
+  const { subdomain } = useCurrentSubdomain();
 
   const { data, error } = useSWR<any>(
-    id
+    workspaceId && !isMegaWorkspace && enabled
       ? `/api/links/count${getQueryString(
           {
-            workspaceId: id,
-            ...(groupBy && { groupBy }),
+            workspaceId,
+            ...query,
           },
-          {
-            ignore: ["import", "upgrade", "newLink"],
-          },
+          ignoreParams
+            ? { include: [] }
+            : {
+                exclude: ["import", "upgrade", "newLink"],
+              },
         )}`
-      : admin
+      : subdomain === "admin"
         ? `/api/admin/links/count${getQueryString({
-            ...(groupBy && { groupBy }),
+            ...query,
           })}`
         : null,
     fetcher,
     {
-      dedupingInterval: 30000,
+      dedupingInterval: 60000,
       keepPreviousData: true,
     },
   );
 
   return {
-    data,
-    loading: !error && !data,
+    data: data as T,
+    loading: !error && data === undefined,
     error,
   };
 }

@@ -1,50 +1,71 @@
-import {
-  ApiMiddleware,
-  AppMiddleware,
-  LinkMiddleware,
-  RootMiddleware,
-} from "@/lib/middleware";
-import { parse } from "@/lib/middleware/utils";
+import { logger } from "@/lib/axiom/server";
+import { transformMiddlewareRequest } from "@axiomhq/nextjs";
 import {
   ADMIN_HOSTNAMES,
   API_HOSTNAMES,
-  APP_HOSTNAMES,
   DEFAULT_REDIRECTS,
+  isValidUrl,
 } from "@dub/utils";
+import { isAppHostname, PARTNERS_HOSTNAMES } from "@dub/utils/src/constants";
 import { NextFetchEvent, NextRequest, NextResponse } from "next/server";
-import AdminMiddleware from "./lib/middleware/admin";
+import { AdminMiddleware } from "./lib/middleware/admin";
+import { ApiMiddleware } from "./lib/middleware/api";
+import { AppMiddleware } from "./lib/middleware/app";
+import { CreateLinkMiddleware } from "./lib/middleware/create-link";
+import { LinkMiddleware } from "./lib/middleware/link";
+import { PartnersMiddleware } from "./lib/middleware/partners";
+import { parse } from "./lib/middleware/utils/parse";
+import { supportedWellKnownFiles } from "./lib/well-known";
 
 export const config = {
+  runtime: "nodejs",
   matcher: [
     /*
      * Match all paths except for:
      * 1. /api/ routes
      * 2. /_next/ (Next.js internals)
-     * 3. /_proxy/ (special page for OG tags proxying)
-     * 4. /_static (inside /public)
-     * 5. /_vercel (Vercel internals)
-     * 6. Static files (e.g. /favicon.ico, /sitemap.xml, /robots.txt, etc.)
+     * 3. /_proxy/ (proxies for third-party services)
+     * 4. Metadata files: favicon.ico, sitemap.xml, robots.txt, manifest.webmanifest
      */
-    "/((?!api/|_next/|_proxy/|_static|_vercel|[\\w-]+\\.\\w+).*)",
+    "/((?!api/|_next/|_proxy/|favicon.ico|sitemap.xml|robots.txt|manifest.webmanifest).*)",
   ],
 };
 
 export default async function middleware(req: NextRequest, ev: NextFetchEvent) {
-  const { domain, path, key } = parse(req);
+  const { domain, path, key, fullKey } = parse(req);
 
-  // for App
-  if (APP_HOSTNAMES.has(domain)) {
+  // Axiom logging
+  logger.info(...transformMiddlewareRequest(req));
+  ev.waitUntil(logger.flush());
+
+  // for app.dub.co
+  if (isAppHostname(domain)) {
     return AppMiddleware(req);
   }
 
-  // for API
+  // for api.dub.co
   if (API_HOSTNAMES.has(domain)) {
     return ApiMiddleware(req);
   }
 
-  // for public stats pages (e.g. d.to/stats/try)
+  // for public stats pages (e.g. d.to/stats/try -> rewrite to [/domain]/[key]/stats)
   if (path.startsWith("/stats/")) {
-    return NextResponse.rewrite(new URL(`/${domain}${path}`, req.url));
+    return NextResponse.rewrite(
+      new URL(
+        `/${domain}/${encodeURIComponent(path.replace("/stats/", ""))}/stats`,
+        req.url,
+      ),
+    );
+  }
+
+  // for .well-known routes
+  if (path.startsWith("/.well-known/")) {
+    const file = path.split("/.well-known/").pop();
+    if (file && supportedWellKnownFiles.includes(file)) {
+      return NextResponse.rewrite(
+        new URL(`/wellknown/${domain}/${file}`, req.url),
+      );
+    }
   }
 
   // default redirects for dub.sh
@@ -52,14 +73,16 @@ export default async function middleware(req: NextRequest, ev: NextFetchEvent) {
     return NextResponse.redirect(DEFAULT_REDIRECTS[key]);
   }
 
-  // for Admin
   if (ADMIN_HOSTNAMES.has(domain)) {
     return AdminMiddleware(req);
   }
 
-  // for root pages (e.g. dub.sh, chatg.pt, etc.)
-  if (key.length === 0) {
-    return RootMiddleware(req, ev);
+  if (PARTNERS_HOSTNAMES.has(domain)) {
+    return PartnersMiddleware(req);
+  }
+
+  if (isValidUrl(fullKey)) {
+    return CreateLinkMiddleware(req);
   }
 
   return LinkMiddleware(req, ev);

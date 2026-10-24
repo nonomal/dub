@@ -1,46 +1,74 @@
-import { useRouterStuff } from "@dub/ui";
+import { useCurrentSubdomain, useRouterStuff } from "@dub/ui";
 import { fetcher } from "@dub/utils";
-import { useEffect, useState } from "react";
-import useSWR from "swr";
-import { LinkWithTagsProps, UserProps } from "../types";
+import useSWR, { SWRConfiguration } from "swr";
+import * as z from "zod/v4";
+import { ExpandedLinkProps, UserProps } from "../types";
+import { getLinksQuerySchemaExtended } from "../zod/schemas/links";
 import useWorkspace from "./use-workspace";
 
-export default function useLinks() {
-  const { id } = useWorkspace();
+const partialQuerySchema = getLinksQuerySchemaExtended.partial();
+
+export default function useLinks(
+  opts: z.infer<typeof partialQuerySchema> = {},
+  swrOpts: SWRConfiguration = {},
+) {
+  const { id: workspaceId, isMegaWorkspace } = useWorkspace();
   const { getQueryString } = useRouterStuff();
 
-  const [admin, setAdmin] = useState(false);
-  useEffect(() => {
-    if (window.location.host.startsWith("admin.")) {
-      setAdmin(true);
-    }
-  }, []);
+  const { subdomain } = useCurrentSubdomain();
 
-  const { data: links, isValidating } = useSWR<
-    (LinkWithTagsProps & {
+  const {
+    data: links,
+    isValidating,
+    error,
+  } = useSWR<
+    (ExpandedLinkProps & {
       user: UserProps;
     })[]
   >(
-    id
+    workspaceId
       ? `/api/links${getQueryString(
-          { workspaceId: id },
           {
-            ignore: ["import", "upgrade", "newLink"],
+            workspaceId,
+            includeUser: "true",
+            includeDashboard: "true",
+            ...opts,
+            // don't show archived on mega workspaces
+            ...(isMegaWorkspace
+              ? {
+                  showArchived: "false",
+                }
+              : {}),
+          },
+          {
+            include: [
+              "folderId",
+              "tagIds",
+              "domain",
+              "userId",
+              "search",
+              "page",
+              "sortBy",
+              "sortOrder",
+              "showArchived",
+            ],
           },
         )}`
-      : admin
-        ? `/api/admin/links${getQueryString()}`
+      : subdomain === "admin"
+        ? `/api/admin/links${getQueryString(opts)}`
         : null,
     fetcher,
     {
       dedupingInterval: 20000,
       revalidateOnFocus: false,
       keepPreviousData: true,
+      ...swrOpts,
     },
   );
 
   return {
     links,
     isValidating,
+    error,
   };
 }

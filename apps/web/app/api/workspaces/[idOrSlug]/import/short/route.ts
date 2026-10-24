@@ -1,16 +1,40 @@
-import { addDomainToVercel } from "@/lib/api/domains";
-import { withAuth } from "@/lib/auth";
+import { createId } from "@/lib/api/create-id";
+import { addDomainToVercel } from "@/lib/api/domains/add-domain-vercel";
+import { isValidDomainFormat } from "@/lib/api/domains/is-valid-domain";
+import { DubApiError } from "@/lib/api/errors";
+import { bulkCreateLinks } from "@/lib/api/links";
+import { parseRequestBody } from "@/lib/api/utils";
+import { withWorkspace } from "@/lib/auth";
 import { qstash } from "@/lib/cron";
-import prisma from "@/lib/prisma";
+import { verifyFolderAccess } from "@/lib/folder/permissions";
+import { prisma } from "@/lib/prisma";
 import { redis } from "@/lib/upstash";
 import { APP_DOMAIN_WITH_NGROK, fetchWithTimeout } from "@dub/utils";
 import { NextResponse } from "next/server";
+import * as z from "zod/v4";
+
+const importShortSchema = z.object({
+  selectedDomains: z.array(
+    z.object({
+      id: z.union([z.string(), z.number()]),
+      domain: z
+        .string()
+        .trim()
+        .refine(isValidDomainFormat, { message: "Invalid domain" }),
+    }),
+  ),
+  importTags: z.boolean().optional(),
+  folderId: z.string().nullish(),
+});
 
 // GET /api/workspaces/[idOrSlug]/import/short – get all short.io domains for a workspace
-export const GET = withAuth(async ({ workspace }) => {
+export const GET = withWorkspace(async ({ workspace }) => {
   const accessToken = await redis.get(`import:short:${workspace.id}`);
   if (!accessToken) {
-    return new Response("No Short.io access token found", { status: 400 });
+    throw new DubApiError({
+      code: "bad_request",
+      message: "No Short.io access token found",
+    });
   }
 
   const response = await fetch(`https://api.short.io/api/domains`, {
@@ -21,7 +45,12 @@ export const GET = withAuth(async ({ workspace }) => {
   });
   const data = await response.json();
   if (data.error === "Unauthorized") {
-    return new Response("Invalid Short.io access token", { status: 403 });
+    // delete the access token
+    await redis.del(`import:short:${workspace.id}`);
+    throw new DubApiError({
+      code: "unauthorized",
+      message: "Invalid Short.io access token",
+    });
   }
 
   const domains = await Promise.all(
@@ -52,50 +81,86 @@ export const GET = withAuth(async ({ workspace }) => {
 });
 
 // PUT /api/workspaces/[idOrSlug]/import/short - save Short.io API key
-export const PUT = withAuth(async ({ req, workspace }) => {
-  const { apiKey } = await req.json();
-  const response = await redis.set(`import:short:${workspace.id}`, apiKey);
-  return NextResponse.json(response);
-});
+export const PUT = withWorkspace(
+  async ({ req, workspace }) => {
+    const { apiKey } = await req.json();
+    const response = await redis.set(`import:short:${workspace.id}`, apiKey);
+    return NextResponse.json(response);
+  },
+  {
+    requiredPermissions: ["links.write"],
+  },
+);
 
 // POST /api/workspaces/[idOrSlug]/import/short - create job to import links from Short.io
-export const POST = withAuth(async ({ req, workspace, session }) => {
-  const { selectedDomains, importTags } = await req.json();
+export const POST = withWorkspace(
+  async ({ req, workspace, session }) => {
+    const { selectedDomains, importTags, folderId } = importShortSchema.parse(
+      await parseRequestBody(req),
+    );
 
-  // check if there are domains that are not in the workspace
-  // if yes, add them to the workspace
-  const domainsNotInWorkspace = selectedDomains.filter(
-    ({ domain }) => !workspace.domains?.find((d) => d.slug === domain),
-  );
-  if (domainsNotInWorkspace.length > 0) {
-    await Promise.allSettled([
-      prisma.domain.createMany({
-        data: domainsNotInWorkspace.map(({ domain }) => ({
-          slug: domain,
-          target: null,
-          type: "redirect",
-          projectId: workspace.id,
-          primary: false,
-        })),
-        skipDuplicates: true,
-      }),
-      domainsNotInWorkspace.map(({ domain }) => addDomainToVercel(domain)),
-    ]);
-  }
+    if (folderId) {
+      await verifyFolderAccess({
+        workspace,
+        userId: session.user.id,
+        folderId,
+        requiredPermission: "folders.links.write",
+      });
+    }
 
-  const response = await Promise.all(
-    selectedDomains.map(({ id, domain }) =>
-      qstash.publishJSON({
-        url: `${APP_DOMAIN_WITH_NGROK}/api/cron/import/short`,
-        body: {
-          workspaceId: workspace.id,
-          userId: session?.user?.id,
-          domainId: id,
+    const domains = await prisma.domain.findMany({
+      where: { projectId: workspace.id },
+      select: { slug: true },
+    });
+
+    // check if there are domains that are not in the workspace
+    // if yes, add them to the workspace
+    const domainsNotInWorkspace = selectedDomains.filter(
+      ({ domain }) => !domains?.find((d) => d.slug === domain),
+    );
+    if (domainsNotInWorkspace.length > 0) {
+      await Promise.allSettled([
+        prisma.domain.createMany({
+          data: domainsNotInWorkspace.map(({ domain }) => ({
+            id: createId({ prefix: "dom_" }),
+            slug: domain,
+            projectId: workspace.id,
+            primary: false,
+          })),
+          skipDuplicates: true,
+        }),
+        domainsNotInWorkspace.map(({ domain }) => addDomainToVercel(domain)),
+      ]);
+      await bulkCreateLinks({
+        links: domainsNotInWorkspace.map(({ domain }) => ({
           domain,
-          importTags,
-        },
-      }),
-    ),
-  );
-  return NextResponse.json(response);
-});
+          key: "_root",
+          url: "",
+          userId: session?.user?.id,
+          projectId: workspace.id,
+          folderId,
+        })),
+      });
+    }
+
+    const response = await Promise.all(
+      selectedDomains.map(({ id, domain }) =>
+        qstash.publishJSON({
+          url: `${APP_DOMAIN_WITH_NGROK}/api/cron/import/short`,
+          body: {
+            workspaceId: workspace.id,
+            userId: session?.user?.id,
+            domainId: id,
+            domain,
+            folderId,
+            importTags,
+          },
+        }),
+      ),
+    );
+    return NextResponse.json(response);
+  },
+  {
+    requiredPermissions: ["links.write"],
+  },
+);

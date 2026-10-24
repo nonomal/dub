@@ -1,27 +1,55 @@
-import { SHORT_DOMAIN } from "@dub/utils";
+import { isAppHostname, SHORT_DOMAIN } from "@dub/utils";
 import { NextRequest } from "next/server";
+import { DOMAIN_REDIRECTS } from "./domain-redirects";
 
 export const parse = (req: NextRequest) => {
   let domain = req.headers.get("host") as string;
+  // path is the path of the URL (e.g. dub.sh/stats/github -> /stats/github)
+  let path = req.nextUrl.pathname;
+
   // remove www. from domain and convert to lowercase
-  domain = domain.replace("www.", "").toLowerCase();
-  if (domain === "dub.localhost:8888" || domain.endsWith(".vercel.app")) {
-    // for local development and preview URLs
-    domain = SHORT_DOMAIN;
+  domain = domain.replace(/^www./, "").toLowerCase();
+
+  if (DOMAIN_REDIRECTS[domain]) {
+    domain = DOMAIN_REDIRECTS[domain];
   }
 
-  // path is the path of the URL (e.g. dub.co/stats/github -> /stats/github)
-  let path = req.nextUrl.pathname;
+  const isE2ERedirectTestRequest =
+    // local development
+    domain === "dub.localhost:8888" ||
+    // preview environment
+    (process.env.VERCEL_ENV === "preview" &&
+      isAppHostname(domain) &&
+      req.headers.get("x-e2e-redirect-test") === "true");
+
+  if (isE2ERedirectTestRequest) {
+    if (path.toLowerCase() === "/case-sensitive-test") {
+      // special case for case-sensitive link test
+      domain = "dub-internal-test.com";
+    } else {
+      // for local development and preview URLs
+      domain = SHORT_DOMAIN;
+    }
+  }
 
   // fullPath is the full URL path (along with search params)
   const searchParams = req.nextUrl.searchParams.toString();
-  const fullPath = `${path}${
-    searchParams.length > 0 ? `?${searchParams}` : ""
-  }`;
+  const searchParamsObj = Object.fromEntries(req.nextUrl.searchParams);
+  const searchParamsString = searchParams.length > 0 ? `?${searchParams}` : "";
+  const fullPath = `${path}${searchParamsString}`;
 
-  // Here, we are using decodeURIComponent to handle foreign languages like Hebrew
-  const key = decodeURIComponent(path.split("/")[1]); // key is the first part of the path (e.g. dub.co/stats/github -> stats)
+  // Here, we are using decodeURIComponent to handle foreign languages like Hebrew and Korean
+  const key = decodeURIComponent(path.split("/")[1]); // key is the first part of the path (e.g. dub.sh/stats/github -> stats)
   const fullKey = decodeURIComponent(path.slice(1)); // fullKey is the full path without the first slash (to account for multi-level subpaths, e.g. d.to/github/repo -> github/repo)
 
-  return { domain, path, fullPath, key, fullKey };
+  return {
+    domain,
+    path,
+    fullPath,
+    key,
+    fullKey,
+    shortLink: `https://${domain}/${fullKey}`,
+    searchParamsObj,
+    searchParamsString,
+  };
 };

@@ -1,60 +1,137 @@
-import { DubApiError, handleAndReturnErrorResponse } from "@/lib/api/errors";
+import { handleAndReturnErrorResponse } from "@/lib/api/errors";
+import { ratelimitOrThrow } from "@/lib/api/utils";
+import { getShortLinkViaEdge, getWorkspaceViaEdge } from "@/lib/planetscale";
+import { getDomainViaEdge } from "@/lib/planetscale/get-domain-via-edge";
+import { getQRAsSVG } from "@/lib/qr/api";
+import { DEFAULT_BGCOLOR } from "@/lib/qr/constants";
 import { QRCodeSVG } from "@/lib/qr/utils";
-import { ratelimit } from "@/lib/upstash";
-import { getQRCodeQuerySchema } from "@/lib/zod/schemas";
-import { getSearchParams } from "@dub/utils";
-import { ipAddress } from "@vercel/edge";
-import { getToken } from "next-auth/jwt";
+import { getQRCodeQuerySchema } from "@/lib/zod/schemas/qr";
+import { DUB_QR_LOGO, getSearchParams, isDubDomain } from "@dub/utils";
 import { ImageResponse } from "next/og";
 import { NextRequest } from "next/server";
 
 export const runtime = "edge";
 
+const CORS_HEADERS = new Headers({
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+});
+
 export async function GET(req: NextRequest) {
   try {
-    // Rate limit if user is not logged in
-    const session = await getToken({
-      req,
-      secret: process.env.NEXTAUTH_SECRET,
-    });
-    if (!session?.email) {
-      const ip = ipAddress(req);
-      const { success } = await ratelimit().limit(`qr:${ip}`);
-      if (!success) {
-        throw new DubApiError({
-          code: "rate_limit_exceeded",
-          message: "Don't DDoS me pls 🥺",
-        });
-      }
+    const paramsParsed = getQRCodeQuerySchema.parse(getSearchParams(req.url));
+
+    await ratelimitOrThrow(req, "qr");
+
+    const {
+      logo,
+      url,
+      size,
+      level,
+      fgColor,
+      bgColor,
+      margin,
+      hideLogo,
+      format,
+    } = paramsParsed;
+
+    const qrCodeLogo = await getQRCodeLogo({ url, logo, hideLogo });
+
+    const qrProps = {
+      value: url,
+      size,
+      level,
+      fgColor,
+      margin,
+      ...(qrCodeLogo
+        ? {
+            imageSettings: {
+              src: qrCodeLogo,
+              height: size / 4,
+              width: size / 4,
+              excavate: true,
+            },
+          }
+        : {}),
+    };
+
+    if (format === "svg") {
+      const svgString = await getQRAsSVG({
+        ...qrProps,
+        ...(bgColor ? { bgColor } : {}),
+      });
+      const headers = new Headers(CORS_HEADERS);
+      headers.set("Content-Type", "image/svg+xml");
+      headers.set("Content-Disposition", "inline; filename=qr.svg");
+      return new Response(svgString, { headers });
     }
-
-    const params = getSearchParams(req.url);
-    const { url, size, level, fgColor, bgColor, includeMargin } =
-      getQRCodeQuerySchema.parse(params);
-
-    // const logo = req.nextUrl.searchParams.get("logo") || "https://assets.dub.co/logo.png";
 
     return new ImageResponse(
       QRCodeSVG({
-        value: url,
-        size,
-        level,
-        includeMargin,
-        fgColor,
-        bgColor,
-        // imageSettings: {
-        //   src: logo,
-        //   height: size / 4,
-        //   width: size / 4,
-        //   excavate: true,
-        // },
+        ...qrProps,
+        bgColor: bgColor ?? DEFAULT_BGCOLOR,
+        isOGContext: true,
       }),
       {
         width: size,
         height: size,
+        headers: CORS_HEADERS,
       },
     );
   } catch (error) {
-    return handleAndReturnErrorResponse(error);
+    return handleAndReturnErrorResponse(error, CORS_HEADERS);
   }
+}
+
+const getQRCodeLogo = async ({
+  url,
+  logo,
+  hideLogo,
+}: {
+  url: string;
+  logo: string | undefined;
+  hideLogo: boolean;
+}) => {
+  const shortLink = await getShortLinkViaEdge(url.split("?")[0]);
+
+  // Not a Dub link
+  if (!shortLink) {
+    return DUB_QR_LOGO;
+  }
+
+  const workspace = await getWorkspaceViaEdge({
+    workspaceId: shortLink.projectId,
+  });
+
+  if (workspace?.plan === "free") {
+    return DUB_QR_LOGO;
+  }
+
+  // if hideLogo is set, return null
+  if (hideLogo) {
+    return null;
+  }
+
+  // if logo is passed, return it
+  if (logo) {
+    return logo;
+  }
+
+  // if it's a Dub owned domain and no  workspace logo is set, use the Dub logo
+  if (isDubDomain(shortLink.domain) && !workspace?.logo) {
+    return DUB_QR_LOGO;
+  }
+
+  // if it's a custom domain, check if it has a logo
+  const domain = await getDomainViaEdge(shortLink.domain);
+
+  // return domain logo if it has one, otherwise fallback to workspace logo, and finally fallback to Dub logo
+  return domain?.logo || workspace?.logo || DUB_QR_LOGO;
+};
+
+export function OPTIONS() {
+  return new Response(null, {
+    status: 204,
+    headers: CORS_HEADERS,
+  });
 }

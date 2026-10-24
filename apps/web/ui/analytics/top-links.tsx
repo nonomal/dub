@@ -1,149 +1,287 @@
-import { TopLinksTabs } from "@/lib/analytics";
-import { LoadingSpinner, Modal, Switch, useRouterStuff } from "@dub/ui";
-import { fetcher, linkConstructor, truncate } from "@dub/utils";
-import { Maximize, X } from "lucide-react";
-import Link from "next/link";
-import { useSearchParams } from "next/navigation";
-import { useContext, useEffect, useState } from "react";
-import useSWR from "swr";
-import { AnalyticsContext } from ".";
-import BarList from "./bar-list";
+import { AnalyticsGroupByOptions } from "@/lib/analytics/types";
+import { usePartnerLinksDisplay } from "@/lib/swr/use-partner-links-display";
+import { useWorkspacePreferences } from "@/lib/swr/use-workspace-preferences";
+import { LinkLogo, useRouterStuff } from "@dub/ui";
+import { Globe, Hyperlink } from "@dub/ui/icons";
+import { getApexDomain } from "@dub/utils";
+import { useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { FolderIcon } from "../folders/folder-icon";
+import TagBadge from "../links/tag-badge";
+import { AnalyticsCard } from "./analytics-card";
+import { AnalyticsLoadingSpinner } from "./analytics-loading-spinner";
+import { AnalyticsContext } from "./analytics-provider";
+import { BarList } from "./bar-list";
+import { useAnalyticsFilterOption } from "./utils";
 
-export default function TopLinks() {
-  const [tab, setTab] = useState<TopLinksTabs>("link");
+type TabId = "links" | "urls";
+type LinksSubtab = "links" | "folders" | "tags";
+type UrlsSubtab = "base_urls" | "full_urls";
+type Subtab = LinksSubtab | UrlsSubtab;
 
-  const { basePath, baseApiPath, queryString, domain, key } =
+const TAB_CONFIG: Record<
+  TabId,
+  {
+    subtabs: Subtab[];
+    defaultSubtab: Subtab;
+    getSubtabLabel: (subtab: Subtab) => string;
+    getGroupBy: (subtab: Subtab) => {
+      groupBy: AnalyticsGroupByOptions;
+    };
+  }
+> = {
+  links: {
+    subtabs: ["links", "folders", "tags"],
+    defaultSubtab: "links",
+    getSubtabLabel: (subtab) => {
+      if (subtab === "links") return "Links";
+      if (subtab === "folders") return "Folders";
+      return "Tags";
+    },
+    getGroupBy: (subtab) => {
+      if (subtab === "links") return { groupBy: "top_links" };
+      if (subtab === "folders") return { groupBy: "top_folders" };
+      return { groupBy: "top_link_tags" };
+    },
+  },
+  urls: {
+    subtabs: ["base_urls", "full_urls"],
+    defaultSubtab: "base_urls",
+    getSubtabLabel: (subtab) =>
+      subtab === "full_urls" ? "Full URLs" : "Base URLs",
+    getGroupBy: (subtab) => ({
+      groupBy: subtab === "full_urls" ? "top_urls" : "top_base_urls",
+    }),
+  },
+};
+
+export function TopLinks() {
+  const { queryParams, searchParams } = useRouterStuff();
+
+  const { selectedTab, saleUnit, adminPage, partnerPage, dashboardProps } =
     useContext(AnalyticsContext);
+  const dataKey = selectedTab === "sales" ? saleUnit : "count";
+
+  const [tab, setTab] = useState<TabId>("links");
+  const [subtab, setSubtab] = useState<Subtab>(TAB_CONFIG[tab].defaultSubtab);
+
+  const [selectedItems, setSelectedItems] = useState<string[]>([]);
+
+  // Reset subtab when tab changes to ensure it's valid for the new tab
+  const handleTabChange = (newTab: TabId) => {
+    setTab(newTab);
+    setSubtab(TAB_CONFIG[newTab].defaultSubtab);
+  };
 
   useEffect(() => {
-    if (domain && key) {
-      setTab("url");
-    } else {
-      setTab("link");
-    }
-  }, [domain, key]);
+    setSelectedItems([]);
+  }, [tab, subtab]);
 
-  const { data } = useSWR<
-    ({ domain: string; key: string } & {
-      [key in TopLinksTabs]: string;
-    } & { clicks: number })[]
-  >(`${baseApiPath}/top_${tab}s?${queryString}`, fetcher);
+  const filterParamKey = useMemo(() => {
+    if (subtab === "links") return "linkId";
+    if (subtab === "base_urls") return "url";
+    if (subtab === "folders") return "folderId";
+    if (subtab === "tags") return "tagId";
+    return null;
+  }, [subtab]);
 
-  const { queryParams } = useRouterStuff();
-  const searchParams = useSearchParams();
-  const excludeRoot = !!searchParams.get("excludeRoot");
-  const [showModal, setShowModal] = useState(false);
+  const onToggleFilter = useCallback((val: string) => {
+    setSelectedItems((prev) =>
+      prev.includes(val) ? prev.filter((v) => v !== val) : [...prev, val],
+    );
+  }, []);
 
-  const barList = (limit?: number) => (
-    <BarList
-      tab={tab}
-      data={
-        data?.map((d) => ({
-          icon: null,
-          title: d[tab],
-          href: queryParams({
-            set: {
-              [tab]: d[tab],
-            },
-            getNewPath: true,
-          }) as string,
-          clicks: d.clicks,
-        })) || []
+  const onApplyFilterValues = useCallback(
+    (values: string[]) => {
+      if (!filterParamKey) return;
+
+      if (values.length === 0) {
+        queryParams({ del: filterParamKey });
+      } else {
+        queryParams({
+          set: { [filterParamKey]: values.join(",") },
+        });
       }
-      maxClicks={data?.[0]?.clicks || 0}
-      barBackground="bg-blue-100"
-      setShowModal={setShowModal}
-      {...(limit && { limit })}
-    />
+
+      setSelectedItems([]);
+    },
+    [filterParamKey, queryParams],
   );
 
+  const isFilterActive = useMemo(
+    () => (filterParamKey ? searchParams.has(filterParamKey) : false),
+    [filterParamKey, searchParams],
+  );
+
+  const activeFilterValues = useMemo(
+    () =>
+      filterParamKey ? searchParams.get(filterParamKey)?.split(",") ?? [] : [],
+    [filterParamKey, searchParams],
+  );
+
+  const onClearFilter = useCallback(() => {
+    setSelectedItems([]);
+    if (isFilterActive && filterParamKey) queryParams({ del: filterParamKey });
+  }, [filterParamKey, queryParams, isFilterActive]);
+
+  const groupByParams = useMemo(
+    () => TAB_CONFIG[tab].getGroupBy(subtab),
+    [tab, subtab],
+  );
+
+  const { data } = useAnalyticsFilterOption(groupByParams);
+  const { data: allData } = useAnalyticsFilterOption(groupByParams, {
+    omitGroupByFilterKey: true,
+  });
+
+  const [persisted] = useWorkspacePreferences("linksDisplay");
+  const { displayProperties: partnerDisplayProperties } =
+    usePartnerLinksDisplay();
+
+  const getItemTitle = useCallback(
+    (d: Record<string, any>) => {
+      if (tab === "urls") {
+        return d.url || "Unknown";
+      }
+
+      // For links tab with different subtabs
+      if (subtab === "folders") {
+        return d.folder?.name || "Unknown";
+      }
+      if (subtab === "tags") {
+        return d.tag?.name || "Unknown";
+      }
+
+      if (partnerPage) {
+        if (
+          partnerDisplayProperties.includes("title") &&
+          d.partnerLinkTitle
+        ) {
+          return d.partnerLinkTitle;
+        }
+        return d.shortLink || "Unknown";
+      }
+
+      // For links subtab
+      const displayProperties = persisted?.displayProperties;
+
+      if (displayProperties?.includes("title") && d.title) {
+        return d.title;
+      }
+
+      return d.shortLink || "Unknown";
+    },
+    [persisted, tab, subtab, partnerPage, partnerDisplayProperties],
+  );
+
+  const mapItem = useCallback(
+    (d: Record<string, any>) => {
+      const isLinksTab = tab === "links";
+      const isUrlsTab = tab === "urls";
+      const isFoldersSubtab = isLinksTab && subtab === "folders";
+      const isTagsSubtab = isLinksTab && subtab === "tags";
+      const isLinksSubtab = isLinksTab && subtab === "links";
+
+      let icon;
+      if (isFoldersSubtab) {
+        icon = d.folder ? (
+          <FolderIcon folder={d.folder} shape="square" iconClassName="size-3" />
+        ) : null;
+      } else if (isTagsSubtab) {
+        icon = d.tag ? (
+          <TagBadge color={d.tag.color} withIcon className="sm:p-1" />
+        ) : null;
+      } else {
+        icon = (
+          <LinkLogo
+            apexDomain={getApexDomain(d.url || "")}
+            className="size-5 sm:size-5"
+          />
+        );
+      }
+
+      let filterValue: string | undefined;
+      if (isLinksSubtab) filterValue = d.id;
+      else if (isUrlsTab && subtab === "base_urls") filterValue = d.url;
+      else if (isFoldersSubtab) filterValue = d.folderId;
+      else if (isTagsSubtab) filterValue = d.tagId;
+
+      return {
+        icon,
+        title: getItemTitle(d),
+        filterValue,
+        value: d[dataKey] || 0,
+        ...(isLinksSubtab && { linkData: d }),
+      };
+    },
+    [tab, subtab, dataKey, getItemTitle],
+  );
+
+  const subTabProps = useMemo(() => {
+    if (adminPage || partnerPage || dashboardProps) return {};
+    const config = TAB_CONFIG[tab];
+    return {
+      subTabs: config.subtabs.map((s) => ({
+        id: s,
+        label: config.getSubtabLabel(s),
+      })),
+      selectedSubTabId: subtab,
+      onSelectSubTab: setSubtab,
+    };
+  }, [tab, subtab, adminPage, partnerPage]);
+
   return (
-    <>
-      <Modal
-        showModal={showModal}
-        setShowModal={setShowModal}
-        className="max-w-lg"
-      >
-        <div className="border-b border-gray-200 px-6 py-4">
-          <h1 className="text-lg font-semibold">Top Links</h1>
-        </div>
-        {barList()}
-      </Modal>
-      <div className="scrollbar-hide relative z-0 h-[400px] border border-gray-200 bg-white px-7 py-5 sm:rounded-lg sm:border-gray-100 sm:shadow-lg">
-        <div className="mb-3 flex justify-between">
-          <h1 className="text-lg font-semibold capitalize">
-            Top {tab === "link" ? "Links" : "URLs"}
-          </h1>
-          {domain && key ? (
-            !basePath.startsWith("/stats") && (
-              <Link
-                className="flex items-center space-x-1 rounded-lg border border-gray-200 bg-gray-50 px-3 py-1 text-sm text-gray-500 transition-all hover:bg-gray-100"
-                href={
-                  queryParams({
-                    del: ["domain", "key"],
-                    getNewPath: true,
-                  }) as string
-                }
-              >
-                <strong className="text-gray-800">
-                  {truncate(linkConstructor({ domain, key, pretty: true }), 24)}
-                </strong>
-                <X className="h-4 w-4" />
-              </Link>
-            )
-          ) : (
-            <Link
-              href={
-                queryParams({
-                  ...(excludeRoot
-                    ? {
-                        del: "excludeRoot",
-                      }
-                    : {
-                        set: {
-                          excludeRoot: "true",
-                        },
-                      }),
-                  getNewPath: true,
-                }) as string
-              }
-              className="flex items-center space-x-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-1 hover:bg-gray-100"
-            >
-              <p className="text-sm font-medium">Exclude Root Domains</p>
-              <Switch
-                checked={excludeRoot}
-                trackDimensions="h-3 w-6"
-                thumbDimensions="w-2 h-2"
-                thumbTranslate="translate-x-3"
-              />
-            </Link>
-          )}
-        </div>
-        {data ? (
+    <AnalyticsCard
+      tabs={[
+        { id: "links", label: "Short Links", icon: Hyperlink },
+        { id: "urls", label: "Destination URLs", icon: Globe },
+      ]}
+      expandLimit={8}
+      dataLength={data?.length}
+      isFilterActive={isFilterActive}
+      onClearFilter={onClearFilter}
+      selectedTabId={tab}
+      onSelectTab={handleTabChange}
+      {...subTabProps}
+    >
+      {({ limit, setShowModal }) =>
+        data ? (
           data.length > 0 ? (
-            barList(9)
+            <BarList
+              tab={tab}
+              data={data?.map(mapItem).sort((a, b) => b.value - a.value) || []}
+              allData={allData?.map(mapItem).sort((a, b) => b.value - a.value)}
+              unit={selectedTab}
+              maxValue={Math.max(...data.map((d) => d[dataKey] ?? 0))}
+              barBackground="bg-orange-100"
+              hoverBackground="hover:bg-gradient-to-r hover:from-orange-50 hover:to-transparent hover:border-orange-500"
+              filterSelectedBackground="bg-orange-500"
+              filterSelectedHoverBackground="hover:bg-orange-600"
+              filterHoverClass="bg-white border border-orange-200"
+              setShowModal={setShowModal}
+              selectedFilterValues={selectedItems}
+              activeFilterValues={activeFilterValues}
+              onToggleFilter={onToggleFilter}
+              onClearFilter={filterParamKey ? onClearFilter : undefined}
+              onClearSelection={() => setSelectedItems([])}
+              onApplyFilterValues={
+                filterParamKey ? onApplyFilterValues : undefined
+              }
+              onRowFilterItem={
+                filterParamKey ? (val) => onApplyFilterValues([val]) : undefined
+              }
+              {...(limit && { limit })}
+            />
           ) : (
             <div className="flex h-[300px] items-center justify-center">
-              <p className="text-sm text-gray-600">No data available</p>
+              <p className="text-sm text-neutral-600">No data available</p>
             </div>
           )
         ) : (
-          <div className="flex h-[300px] items-center justify-center">
-            <LoadingSpinner />
+          <div className="absolute inset-0 flex h-[300px] w-full items-center justify-center bg-white/50">
+            <AnalyticsLoadingSpinner />
           </div>
-        )}
-        {data && data.length > 9 && (
-          <button
-            onClick={() => setShowModal(true)}
-            className="absolute inset-x-0 bottom-4 z-10 mx-auto flex w-full items-center justify-center rounded-md bg-gradient-to-b from-transparent to-white text-gray-500 transition-all hover:text-gray-800 active:scale-95"
-          >
-            <div className="flex items-center space-x-1 bg-white px-4 py-2">
-              <Maximize className="h-4 w-4" />
-              <p className="text-xs font-semibold uppercase">View all</p>
-            </div>
-          </button>
-        )}
-      </div>
-    </>
+        )
+      }
+    </AnalyticsCard>
   );
 }

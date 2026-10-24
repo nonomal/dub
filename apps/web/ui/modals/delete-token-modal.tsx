@@ -1,13 +1,8 @@
-import {
-  Badge,
-  Button,
-  Logo,
-  Modal,
-  TokenAvatar,
-  useMediaQuery,
-} from "@dub/ui";
+import useWorkspace from "@/lib/swr/use-workspace";
+import { TokenProps } from "@/lib/types";
+import { Callout } from "@/ui/shared/callout";
+import { Button, Key, Modal, Tooltip, useMediaQuery } from "@dub/ui";
 import { timeAgo } from "@dub/utils";
-import { Token } from "@prisma/client";
 import {
   Dispatch,
   SetStateAction,
@@ -17,6 +12,7 @@ import {
 } from "react";
 import { toast } from "sonner";
 import { mutate } from "swr";
+import { UserAvatar } from "../users/user-avatar";
 
 function DeleteTokenModal({
   showDeleteTokenModal,
@@ -25,70 +21,160 @@ function DeleteTokenModal({
 }: {
   showDeleteTokenModal: boolean;
   setShowDeleteTokenModal: Dispatch<SetStateAction<boolean>>;
-  token: Token;
+  token: TokenProps;
 }) {
-  const [removing, setRemoving] = useState(false);
-
   const { isMobile } = useMediaQuery();
+  const { id: workspaceId } = useWorkspace();
+  const [removing, setRemoving] = useState(false);
+  const [verification, setVerification] = useState("");
+
+  // Determine the endpoint
+  const isRestrictedToken = "scopes" in token ? true : false;
+
+  const endpoint = useMemo(() => {
+    if (!isRestrictedToken) {
+      return {
+        url: `/api/user/tokens?id=${token.id}`,
+        mutate: "/api/user/tokens",
+      };
+    } else {
+      return {
+        url: `/api/tokens/${token.id}?workspaceId=${workspaceId}`,
+        mutate: `/api/tokens?workspaceId=${workspaceId}`,
+      };
+    }
+  }, [isRestrictedToken]);
+
+  const confirmationText = "confirm delete token";
+  const isVerified = verification === confirmationText;
+
+  const deleteToken = async () => {
+    setRemoving(true);
+    const res = await fetch(endpoint.url, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+    });
+    setRemoving(false);
+    if (res.status === 200) {
+      toast.success(`Successfully deleted API key`);
+      mutate(endpoint.mutate);
+      setShowDeleteTokenModal(false);
+    } else {
+      const { error } = await res.json();
+      toast.error(error.message);
+    }
+  };
 
   return (
     <Modal
       showModal={showDeleteTokenModal}
       setShowModal={setShowDeleteTokenModal}
+      className="max-w-md"
     >
-      <div className="flex flex-col items-center justify-center space-y-3 border-b border-gray-200 px-4 py-4 pt-8 sm:px-16">
-        <Logo />
+      <div className="space-y-2 border-b border-neutral-200 px-4 py-4 sm:px-6">
         <h3 className="text-lg font-medium">Delete API Key</h3>
-        <p className="text-center text-sm text-gray-500">
-          This will permanently delete the API key for and revoke all access to
-          your account. Are you sure you want to continue?
-        </p>
+        {!token.lastUsed && (
+          <p className="text-sm text-neutral-500">
+            This will permanently delete the API key and revoke all access to
+            your account. Are you sure you want to continue?
+          </p>
+        )}
       </div>
 
-      <div className="flex flex-col space-y-4 bg-gray-50 px-4 py-8 text-left sm:px-16">
-        <div className="relative flex items-center space-x-3 rounded-md border border-gray-300 bg-white px-1 py-3">
-          <Badge variant="neutral" className="absolute right-2 top-2">
-            {token.partialKey}
-          </Badge>
-          <TokenAvatar id={token.id} />
-          <div className="flex flex-col">
-            <h3 className="line-clamp-1 w-48 font-semibold text-gray-700">
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+          await deleteToken();
+        }}
+        className="flex flex-col space-y-4 bg-neutral-50 px-4 py-4 sm:px-6"
+      >
+        {token.lastUsed && (
+          <Callout variant="warn" size={2}>
+            <div className="space-y-1">
+              <h3 className="font-semibold">
+                This key is actively in use (last used{" "}
+                {timeAgo(token.lastUsed, { withAgo: true })})
+              </h3>
+              <p>
+                Deleting this key will immediately break any integrations,
+                tracking, or API requests that depend on it. Are you sure you
+                want to continue?
+              </p>
+            </div>
+          </Callout>
+        )}
+
+        <div className="relative flex items-center gap-2 space-x-3 rounded-md border border-neutral-300 bg-white px-4 py-2">
+          <Key className="size-5 text-neutral-500" />
+
+          <div className="flex flex-1 flex-col gap-0.5">
+            <h3 className="line-clamp-1 text-sm font-medium text-neutral-600">
               {token.name}
             </h3>
-            <p className="text-xs text-gray-500" suppressHydrationWarning>
-              Last used {timeAgo(token.lastUsed, { withAgo: true })}
+            <p
+              className="text-xs font-medium text-neutral-500"
+              suppressHydrationWarning
+            >
+              {token.partialKey}
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {token.user && (
+              <Tooltip content={token.user.name}>
+                <div>
+                  <UserAvatar
+                    user={token.user}
+                    className="size-5 rounded-full"
+                  />
+                </div>
+              </Tooltip>
+            )}
+            <p className="text-xs text-neutral-500">
+              {new Date(token.createdAt).toLocaleDateString("en-us", {
+                month: "short",
+                day: "numeric",
+              })}
             </p>
           </div>
         </div>
+
+        <div>
+          <label
+            htmlFor="verification"
+            className="block text-sm text-neutral-700"
+          >
+            To verify, type{" "}
+            <span className="font-semibold">{confirmationText}</span> below
+          </label>
+          <div className="relative mt-1 rounded-md shadow-sm">
+            <input
+              type="text"
+              name="verification"
+              id="verification"
+              pattern={confirmationText}
+              required
+              autoFocus={!isMobile}
+              autoComplete="off"
+              value={verification}
+              onChange={(e) => setVerification(e.target.value)}
+              className="block w-full rounded-md border-neutral-300 text-neutral-900 placeholder-neutral-300 focus:border-neutral-500 focus:outline-none focus:ring-neutral-500 sm:text-sm"
+            />
+          </div>
+        </div>
+
         <Button
-          text="Confirm"
+          text="Delete"
           variant="danger"
-          autoFocus={!isMobile}
           loading={removing}
-          onClick={() => {
-            setRemoving(true);
-            fetch(`/api/user/tokens?id=${token.id}`, {
-              method: "DELETE",
-              headers: { "Content-Type": "application/json" },
-            }).then(async (res) => {
-              setRemoving(false);
-              if (res.status === 200) {
-                toast.success(`Successfully deleted API key`);
-                mutate("/api/user/tokens");
-                setShowDeleteTokenModal(false);
-              } else {
-                const error = await res.text();
-                toast.error(error);
-              }
-            });
-          }}
+          disabled={!isVerified}
         />
-      </div>
+      </form>
     </Modal>
   );
 }
 
-export function useDeleteTokenModal({ token }: { token: Token }) {
+export function useDeleteTokenModal({ token }: { token: TokenProps }) {
   const [showDeleteTokenModal, setShowDeleteTokenModal] = useState(false);
 
   const DeleteTokenModalCallback = useCallback(() => {

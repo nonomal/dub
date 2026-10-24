@@ -3,23 +3,33 @@
  * Copyright (c) Paul O'Shannessy
  * SPDX-License-Identifier: ISC
  */
-import { useEffect, useRef, useState } from "react";
+import { DUB_QR_LOGO } from "@dub/utils/src/constants";
+import { useEffect, useRef, useState, type JSX } from "react";
 import qrcodegen from "./codegen";
 import {
   DEFAULT_BGCOLOR,
   DEFAULT_FGCOLOR,
-  DEFAULT_INCLUDEMARGIN,
   DEFAULT_LEVEL,
+  DEFAULT_MARGIN,
   DEFAULT_SIZE,
   ERROR_LEVEL_MAP,
-  MARGIN_SIZE,
 } from "./constants";
-import { QRProps, QRPropsCanvas } from "./types";
+import {
+  DotStyle,
+  MarkerBorderStyle,
+  MarkerCenterStyle,
+  QRProps,
+  QRPropsCanvas,
+} from "./types";
 import {
   SUPPORTS_PATH2D,
   excavateModules,
+  generateExtraRoundedDotPath,
   generatePath,
+  generateRoundedDotPath,
+  generateSquareDotPath,
   getImageSettings,
+  isFinderPatternCell,
 } from "./utils";
 export * from "./types";
 export * from "./utils";
@@ -31,7 +41,7 @@ export function QRCodeCanvas(props: QRPropsCanvas) {
     level = DEFAULT_LEVEL,
     bgColor = DEFAULT_BGCOLOR,
     fgColor = DEFAULT_FGCOLOR,
-    includeMargin = DEFAULT_INCLUDEMARGIN,
+    margin = DEFAULT_MARGIN,
     style,
     imageSettings,
     ...otherProps
@@ -40,15 +50,10 @@ export function QRCodeCanvas(props: QRPropsCanvas) {
   const _canvas = useRef<HTMLCanvasElement>(null);
   const _image = useRef<HTMLImageElement>(null);
 
-  // We're just using this state to trigger rerenders when images load. We
-  // Don't actually read the value anywhere. A smarter use of useEffect would
-  // depend on this value.
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [isImgLoaded, setIsImageLoaded] = useState(false);
 
   useEffect(() => {
-    // Always update the canvas. It's cheap enough and we want to be correct
-    // with the current state.
     if (_canvas.current != null) {
       const canvas = _canvas.current;
 
@@ -62,12 +67,11 @@ export function QRCodeCanvas(props: QRPropsCanvas) {
         ERROR_LEVEL_MAP[level],
       ).getModules();
 
-      const margin = includeMargin ? MARGIN_SIZE : 0;
       const numCells = cells.length + margin * 2;
       const calculatedImageSettings = getImageSettings(
         cells,
         size,
-        includeMargin,
+        margin,
         imageSettings,
       );
 
@@ -85,22 +89,16 @@ export function QRCodeCanvas(props: QRPropsCanvas) {
         }
       }
 
-      // We're going to scale this so that the number of drawable units
-      // matches the number of cells. This avoids rounding issues, but does
-      // result in some potentially unwanted single pixel issues between
-      // blocks, only in environments that don't support Path2D.
       const pixelRatio = window.devicePixelRatio || 1;
       canvas.height = canvas.width = size * pixelRatio;
       const scale = (size / numCells) * pixelRatio;
       ctx.scale(scale, scale);
 
-      // Draw solid background, only paint dark modules.
       ctx.fillStyle = bgColor;
       ctx.fillRect(0, 0, numCells, numCells);
 
       ctx.fillStyle = fgColor;
       if (SUPPORTS_PATH2D) {
-        // $FlowFixMe: Path2D c'tor doesn't support args yet.
         ctx.fill(new Path2D(generatePath(cells, margin)));
       } else {
         cells.forEach(function (row, rdx) {
@@ -124,8 +122,6 @@ export function QRCodeCanvas(props: QRPropsCanvas) {
     }
   });
 
-  // Ensure we mark image loaded as false here so we trigger updating the
-  // canvas in our other effect.
   useEffect(() => {
     setIsImageLoaded(false);
   }, [imgSrc]);
@@ -160,28 +156,189 @@ export function QRCodeCanvas(props: QRPropsCanvas) {
   );
 }
 
-export function getQRAsSVGDataUri(props: QRProps) {
+// ─── SVG string helpers for download ─────────────────────────────────────────
+
+function roundedRectPath(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+): string {
+  return (
+    `M${x + r},${y}` +
+    `H${x + w - r}` +
+    `A${r},${r} 0 0 1 ${x + w},${y + r}` +
+    `V${y + h - r}` +
+    `A${r},${r} 0 0 1 ${x + w - r},${y + h}` +
+    `H${x + r}` +
+    `A${r},${r} 0 0 1 ${x},${y + h - r}` +
+    `V${y + r}` +
+    `A${r},${r} 0 0 1 ${x + r},${y}` +
+    `Z`
+  );
+}
+
+function circlePath(cx: number, cy: number, r: number): string {
+  return (
+    `M${cx - r},${cy}` +
+    `A${r},${r} 0 1 0 ${cx + r},${cy}` +
+    `A${r},${r} 0 1 0 ${cx - r},${cy}` +
+    `Z`
+  );
+}
+
+function finderBorderPathString(
+  x: number,
+  y: number,
+  borderStyle: MarkerBorderStyle,
+): string {
+  const cx = x + 3.5;
+  const cy = y + 3.5;
+  if (borderStyle === "square") {
+    return (
+      `M${x},${y}H${x + 7}V${y + 7}H${x}Z ` +
+      `M${x + 1},${y + 1}H${x + 6}V${y + 6}H${x + 1}Z`
+    );
+  }
+  if (borderStyle === "rounded-square") {
+    return (
+      roundedRectPath(x, y, 7, 7, 1.5) +
+      " " +
+      roundedRectPath(x + 1, y + 1, 5, 5, 0.75)
+    );
+  }
+  return circlePath(cx, cy, 3.5) + " " + circlePath(cx, cy, 2.5);
+}
+
+function getFinderPatternSVGString({
+  x,
+  y,
+  markerColor,
+  borderStyle = "square",
+  centerStyle = "square",
+}: {
+  x: number;
+  y: number;
+  markerColor: string;
+  bgColor: string;
+  borderStyle?: MarkerBorderStyle;
+  centerStyle?: MarkerCenterStyle;
+}): string {
+  const cx = x + 3.5;
+  const cy = y + 3.5;
+
+  const borderPath = finderBorderPathString(x, y, borderStyle);
+  const border = `<path d="${borderPath}" fill="${markerColor}" fill-rule="evenodd"></path>`;
+
+  const center =
+    centerStyle === "square"
+      ? `<rect x="${x + 2}" y="${y + 2}" width="3" height="3" fill="${markerColor}" shape-rendering="crispEdges"></rect>`
+      : `<circle cx="${cx}" cy="${cy}" r="1.5" fill="${markerColor}"></circle>`;
+
+  return `<g>${border}${center}</g>`;
+}
+
+// ─── Canvas helpers for finder patterns ──────────────────────────────────────
+
+function drawRoundedRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawCanvasFinderPattern(
+  ctx: CanvasRenderingContext2D,
+  fx: number,
+  fy: number,
+  markerColor: string,
+  bgColor: string,
+  borderStyle: MarkerBorderStyle = "square",
+  centerStyle: MarkerCenterStyle = "square",
+) {
+  const cx = fx + 3.5;
+  const cy = fy + 3.5;
+
+  // Draw outer border shape
+  ctx.fillStyle = markerColor;
+  if (borderStyle === "square") {
+    ctx.fillRect(fx, fy, 7, 7);
+  } else if (borderStyle === "rounded-square") {
+    drawRoundedRect(ctx, fx, fy, 7, 7, 1.5);
+  } else {
+    ctx.beginPath();
+    ctx.arc(cx, cy, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Punch the gap in a shape that matches the border style
+  ctx.fillStyle = bgColor;
+  if (borderStyle === "square") {
+    ctx.fillRect(fx + 1, fy + 1, 5, 5);
+  } else if (borderStyle === "rounded-square") {
+    drawRoundedRect(ctx, fx + 1, fy + 1, 5, 5, 0.75);
+  } else {
+    ctx.beginPath();
+    ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Draw inner center
+  ctx.fillStyle = markerColor;
+  if (centerStyle === "square") {
+    ctx.fillRect(fx + 2, fy + 2, 3, 3);
+  } else {
+    ctx.beginPath();
+    ctx.arc(cx, cy, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ─── Public download helpers ──────────────────────────────────────────────────
+
+export async function getQRAsSVGDataUri(props: QRProps) {
   const {
     value,
     size = DEFAULT_SIZE,
     level = DEFAULT_LEVEL,
     bgColor = DEFAULT_BGCOLOR,
     fgColor = DEFAULT_FGCOLOR,
-    includeMargin = DEFAULT_INCLUDEMARGIN,
+    margin = DEFAULT_MARGIN,
     imageSettings,
+    dotStyle = "square",
+    markerCenterStyle = "square",
+    markerBorderStyle = "square",
+    markerColor,
   } = props;
+
+  const effectiveMarkerColor = markerColor ?? fgColor;
 
   let cells = qrcodegen.QrCode.encodeText(
     value,
     ERROR_LEVEL_MAP[level],
   ).getModules();
 
-  const margin = includeMargin ? MARGIN_SIZE : 0;
   const numCells = cells.length + margin * 2;
   const calculatedImageSettings = getImageSettings(
     cells,
     size,
-    includeMargin,
+    margin,
     imageSettings,
   );
 
@@ -189,8 +346,11 @@ export function getQRAsSVGDataUri(props: QRProps) {
   if (imageSettings != null && calculatedImageSettings != null) {
     if (calculatedImageSettings.excavation != null)
       cells = excavateModules(cells, calculatedImageSettings.excavation);
+
+    const base64Image = await getBase64Image(imageSettings.src);
+
     image = [
-      `<image href="${imageSettings.src}"`,
+      `<image href="${base64Image}"`,
       `height="${calculatedImageSettings.h}"`,
       `width="${calculatedImageSettings.w}"`,
       `x="${calculatedImageSettings.x + margin}"`,
@@ -198,18 +358,70 @@ export function getQRAsSVGDataUri(props: QRProps) {
       'preserveAspectRatio="none"></image>',
     ].join(" ");
   }
-  const fgPath = generatePath(cells, margin);
 
+  const fgPath =
+    dotStyle === "rounded"
+      ? generateRoundedDotPath(cells, margin)
+      : dotStyle === "extra-rounded"
+        ? generateExtraRoundedDotPath(cells, margin)
+        : generateSquareDotPath(cells, margin);
+
+  const numModules = cells.length;
+  const finderPositions = [
+    { x: margin, y: margin },
+    { x: numModules - 7 + margin, y: margin },
+    { x: margin, y: numModules - 7 + margin },
+  ];
+
+  const finderSVG = finderPositions
+    .map((pos) =>
+      getFinderPatternSVGString({
+        x: pos.x,
+        y: pos.y,
+        markerColor: effectiveMarkerColor,
+        bgColor,
+        borderStyle: markerBorderStyle,
+        centerStyle: markerCenterStyle,
+      }),
+    )
+    .join("");
+
+  // Omit the background fill so downloaded SVGs have a transparent background.
   const svgData = [
     `<svg xmlns="http://www.w3.org/2000/svg" height="${size}" width="${size}" viewBox="0 0 ${numCells} ${numCells}">`,
-    `<path fill="${bgColor}" d="M0,0 h${numCells}v${numCells}H0z" shapeRendering="crispEdges"></path>`,
-    `<path fill="${fgColor}" d="${fgPath}" shapeRendering="crispEdges"></path>`,
+    `<path fill="${fgColor}" d="${fgPath}" shape-rendering="crispEdges"></path>`,
+    finderSVG,
     image,
     "</svg>",
   ].join("");
 
   return `data:image/svg+xml,${encodeURIComponent(svgData)}`;
 }
+
+const getBase64Image = (imgUrl: string) => {
+  return new Promise(function (resolve, reject) {
+    const img = new Image();
+    img.src = imgUrl;
+    img.setAttribute("crossOrigin", "anonymous");
+
+    img.onload = function () {
+      const canvas = document.createElement("canvas");
+
+      canvas.width = img.width;
+      canvas.height = img.height;
+
+      const ctx = canvas.getContext("2d");
+      ctx?.drawImage(img, 0, 0);
+
+      const dataURL = canvas.toDataURL("image/png");
+      resolve(dataURL);
+    };
+
+    img.onerror = function () {
+      reject("The image could not be loaded.");
+    };
+  });
+};
 
 function waitUntilImageLoaded(img: HTMLImageElement, src: string) {
   return new Promise((resolve) => {
@@ -236,9 +448,15 @@ export async function getQRAsCanvas(
     level = DEFAULT_LEVEL,
     bgColor = DEFAULT_BGCOLOR,
     fgColor = DEFAULT_FGCOLOR,
-    includeMargin = DEFAULT_INCLUDEMARGIN,
+    margin = DEFAULT_MARGIN,
     imageSettings,
+    dotStyle = "square",
+    markerCenterStyle = "square",
+    markerBorderStyle = "square",
+    markerColor,
   } = props;
+
+  const effectiveMarkerColor = markerColor ?? fgColor;
 
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d") as CanvasRenderingContext2D;
@@ -247,12 +465,11 @@ export async function getQRAsCanvas(
     value,
     ERROR_LEVEL_MAP[level],
   ).getModules();
-  const margin = includeMargin ? MARGIN_SIZE : 0;
   const numCells = cells.length + margin * 2;
   const calculatedImageSettings = getImageSettings(
     cells,
     size,
-    includeMargin,
+    margin,
     imageSettings,
   );
 
@@ -271,23 +488,96 @@ export async function getQRAsCanvas(
   const scale = (size / numCells) * pixelRatio;
   ctx.scale(scale, scale);
 
-  // Draw solid background, only paint dark modules.
+  // Background
   ctx.fillStyle = bgColor;
   ctx.fillRect(0, 0, numCells, numCells);
 
+  // Data dots (excluding finder pattern cells)
   ctx.fillStyle = fgColor;
-  if (SUPPORTS_PATH2D) {
-    // $FlowFixMe: Path2D c'tor doesn't support args yet.
-    ctx.fill(new Path2D(generatePath(cells, margin)));
-  } else {
-    cells.forEach(function (row, rdx) {
-      row.forEach(function (cell, cdx) {
-        if (cell) {
-          ctx.fillRect(cdx + margin, rdx + margin, 1, 1);
-        }
+  if (dotStyle === "rounded") {
+    const r = 0.4;
+    cells.forEach((row, y) => {
+      row.forEach((cell, x) => {
+        if (!cell || isFinderPatternCell(x, y, cells.length)) return;
+        const px = x + margin;
+        const py = y + margin;
+        drawRoundedRect(ctx, px, py, 1, 1, r);
       });
     });
+  } else if (dotStyle === "extra-rounded") {
+    const r = 0.5;
+    const n = cells.length;
+    const isDark = (xi: number, yi: number) =>
+      xi >= 0 &&
+      yi >= 0 &&
+      xi < n &&
+      yi < n &&
+      !!(cells[yi][xi] && !isFinderPatternCell(xi, yi, n));
+
+    cells.forEach((row, y) => {
+      row.forEach((cell, x) => {
+        if (!cell || isFinderPatternCell(x, y, n)) return;
+
+        const px = x + margin;
+        const py = y + margin;
+        const top = isDark(x, y - 1);
+        const right = isDark(x + 1, y);
+        const bottom = isDark(x, y + 1);
+        const left = isDark(x - 1, y);
+
+        // Draw as a rounded rect where connected sides have no arc
+        const rTL = top || left ? 0 : r;
+        const rTR = top || right ? 0 : r;
+        const rBR = bottom || right ? 0 : r;
+        const rBL = bottom || left ? 0 : r;
+
+        ctx.beginPath();
+        ctx.moveTo(px + rTL, py);
+        ctx.lineTo(px + 1 - rTR, py);
+        if (rTR > 0) ctx.arcTo(px + 1, py, px + 1, py + rTR, rTR);
+        ctx.lineTo(px + 1, py + 1 - rBR);
+        if (rBR > 0) ctx.arcTo(px + 1, py + 1, px + 1 - rBR, py + 1, rBR);
+        ctx.lineTo(px + rBL, py + 1);
+        if (rBL > 0) ctx.arcTo(px, py + 1, px, py + 1 - rBL, rBL);
+        ctx.lineTo(px, py + rTL);
+        if (rTL > 0) ctx.arcTo(px, py, px + rTL, py, rTL);
+        ctx.closePath();
+        ctx.fill();
+      });
+    });
+  } else {
+    if (SUPPORTS_PATH2D) {
+      ctx.fill(new Path2D(generateSquareDotPath(cells, margin)));
+    } else {
+      cells.forEach((row, rdx) => {
+        row.forEach((cell, cdx) => {
+          if (cell && !isFinderPatternCell(cdx, rdx, cells.length)) {
+            ctx.fillRect(cdx + margin, rdx + margin, 1, 1);
+          }
+        });
+      });
+    }
   }
+
+  // Finder patterns
+  const numModules = cells.length;
+  const finderPositions = [
+    { x: margin, y: margin },
+    { x: numModules - 7 + margin, y: margin },
+    { x: margin, y: numModules - 7 + margin },
+  ];
+
+  finderPositions.forEach(({ x, y }) => {
+    drawCanvasFinderPattern(
+      ctx,
+      x,
+      y,
+      effectiveMarkerColor,
+      bgColor,
+      markerBorderStyle,
+      markerCenterStyle,
+    );
+  });
 
   const haveImageToRender =
     calculatedImageSettings != null &&
@@ -311,4 +601,48 @@ export async function getQRAsCanvas(
   canvas.remove();
   image.remove();
   return url;
+}
+
+export function getQRData({
+  url,
+  fgColor,
+  hideLogo,
+  logo,
+  margin,
+  dotStyle,
+  markerCenterStyle,
+  markerBorderStyle,
+  markerColor,
+}: {
+  url: string;
+  fgColor?: string;
+  hideLogo?: boolean;
+  logo?: string;
+  margin?: number;
+  dotStyle?: DotStyle;
+  markerCenterStyle?: MarkerCenterStyle;
+  markerBorderStyle?: MarkerBorderStyle;
+  markerColor?: string;
+}) {
+  return {
+    value: `${url}?qr=1`,
+    bgColor: "#ffffff",
+    fgColor,
+    size: 1024,
+    level: "Q",
+    hideLogo,
+    margin,
+    dotStyle,
+    markerCenterStyle,
+    markerBorderStyle,
+    markerColor,
+    ...(!hideLogo && {
+      imageSettings: {
+        src: logo || DUB_QR_LOGO,
+        height: 256,
+        width: 256,
+        excavate: true,
+      },
+    }),
+  };
 }

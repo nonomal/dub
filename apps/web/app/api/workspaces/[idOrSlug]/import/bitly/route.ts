@@ -1,17 +1,40 @@
-import { addDomainToVercel } from "@/lib/api/domains";
-import { withAuth } from "@/lib/auth";
+import { createId } from "@/lib/api/create-id";
+import { addDomainToVercel } from "@/lib/api/domains/add-domain-vercel";
+import { isValidDomainFormat } from "@/lib/api/domains/is-valid-domain";
+import { DubApiError } from "@/lib/api/errors";
+import { bulkCreateLinks } from "@/lib/api/links";
+import { parseRequestBody } from "@/lib/api/utils";
+import { withWorkspace } from "@/lib/auth";
 import { qstash } from "@/lib/cron";
-import prisma from "@/lib/prisma";
+import { prisma } from "@/lib/prisma";
 import { BitlyGroupProps } from "@/lib/types";
 import { redis } from "@/lib/upstash";
 import { APP_DOMAIN_WITH_NGROK } from "@dub/utils";
 import { NextResponse } from "next/server";
+import * as z from "zod/v4";
+
+const importBitlySchema = z.object({
+  selectedDomains: z.array(
+    z.object({
+      domain: z
+        .string()
+        .trim()
+        .refine(isValidDomainFormat, { message: "Invalid domain" }),
+      bitlyGroup: z.string(),
+    }),
+  ),
+  selectedGroupTags: z.array(z.string()).default([]),
+  folderId: z.string().nullish(),
+});
 
 // GET /api/workspaces/[idOrSlug]/import/bitly – get all bitly groups for a workspace
-export const GET = withAuth(async ({ workspace }) => {
+export const GET = withWorkspace(async ({ workspace }) => {
   const accessToken = await redis.get(`import:bitly:${workspace.id}`);
   if (!accessToken) {
-    return new Response("No Bitly access token found", { status: 400 });
+    throw new DubApiError({
+      code: "bad_request",
+      message: "No Bitly access token found",
+    });
   }
   const response = await fetch(`https://api-ssl.bitly.com/v4/groups`, {
     headers: {
@@ -21,7 +44,10 @@ export const GET = withAuth(async ({ workspace }) => {
   });
   const data = await response.json();
   if (data.message === "FORBIDDEN") {
-    return new Response("Invalid Bitly access token", { status: 403 });
+    throw new DubApiError({
+      code: "unauthorized",
+      message: "Invalid Bitly access token",
+    });
   }
 
   const groups = data.groups
@@ -49,61 +75,89 @@ export const GET = withAuth(async ({ workspace }) => {
 });
 
 // POST /api/workspaces/[idOrSlug]/import/bitly - create job to import links from bitly
-export const POST = withAuth(async ({ req, workspace, session }) => {
-  const { selectedDomains, selectedGroupTags } = await req.json();
+export const POST = withWorkspace(
+  async ({ req, workspace, session }) => {
+    const { selectedDomains, selectedGroupTags, folderId } =
+      importBitlySchema.parse(await parseRequestBody(req));
 
-  // check if there are domains that are not in the workspace
-  // if yes, add them to the workspace
-  const doaminsNotInWorkspace = selectedDomains.filter(
-    ({ domain }) => !workspace.domains?.find((d) => d.slug === domain),
-  );
-  if (doaminsNotInWorkspace.length > 0) {
-    await Promise.allSettled([
-      prisma.domain.createMany({
-        data: doaminsNotInWorkspace.map(({ domain }) => ({
-          slug: domain,
-          target: null,
-          type: "redirect",
+    const domains = await prisma.domain.findMany({
+      where: { projectId: workspace.id },
+      select: { slug: true },
+    });
+
+    // check if there are domains that are not in the workspace
+    // if yes, add them to the workspace
+    const domainsNotInWorkspace = selectedDomains.filter(
+      ({ domain }) => !domains?.find((d) => d.slug === domain),
+    );
+
+    if (domainsNotInWorkspace.length > 0) {
+      await Promise.allSettled([
+        prisma.domain.createMany({
+          data: domainsNotInWorkspace.map(({ domain }) => ({
+            id: createId({ prefix: "dom_" }),
+            slug: domain,
+            projectId: workspace.id,
+            primary: false,
+          })),
+          skipDuplicates: true,
+        }),
+        domainsNotInWorkspace.flatMap(({ domain }) =>
+          addDomainToVercel(domain),
+        ),
+      ]);
+      await bulkCreateLinks({
+        links: domainsNotInWorkspace.map(({ domain }) => ({
+          domain,
+          key: "_root",
+          url: "",
+          userId: session?.user?.id,
           projectId: workspace.id,
-          primary: false,
+          folderId,
         })),
-        skipDuplicates: true,
-      }),
-      doaminsNotInWorkspace.map(({ slug }) => addDomainToVercel(slug)),
-    ]);
-  }
-
-  // convert data to array of groups with their respective domains
-  const groups = selectedDomains.reduce((result, { domain, bitlyGroup }) => {
-    const existingGroup = result.find((item) => item.bitlyGroup === bitlyGroup);
-    if (existingGroup) {
-      existingGroup.domains.push(domain);
-    } else {
-      result.push({
-        bitlyGroup,
-        domains: [domain],
-        importTags: selectedGroupTags.includes(bitlyGroup),
       });
     }
-    return result;
-  }, []);
 
-  const response = await Promise.all(
-    groups
-      // only add groups that have at least 1 domain selected for import
-      .filter(({ domains }) => domains.length > 0)
-      .map(({ bitlyGroup, domains, importTags }) =>
-        qstash.publishJSON({
-          url: `${APP_DOMAIN_WITH_NGROK}/api/cron/import/bitly`,
-          body: {
-            workspaceId: workspace.id,
-            userId: session?.user?.id,
-            bitlyGroup,
-            domains,
-            importTags,
-          },
-        }),
-      ),
-  );
-  return NextResponse.json(response);
-});
+    // convert data to array of groups with their respective domains
+    const groups = selectedDomains.reduce<
+      { bitlyGroup: string; domains: string[]; importTags: boolean }[]
+    >((result, { domain, bitlyGroup }) => {
+      const existingGroup = result.find(
+        (item) => item.bitlyGroup === bitlyGroup,
+      );
+      if (existingGroup) {
+        existingGroup.domains.push(domain);
+      } else {
+        result.push({
+          bitlyGroup,
+          domains: [domain],
+          importTags: selectedGroupTags.includes(bitlyGroup),
+        });
+      }
+      return result;
+    }, []);
+
+    const response = await Promise.all(
+      groups
+        // only add groups that have at least 1 domain selected for import
+        .filter(({ domains }) => domains.length > 0)
+        .map(({ bitlyGroup, domains, importTags }) =>
+          qstash.publishJSON({
+            url: `${APP_DOMAIN_WITH_NGROK}/api/cron/import/bitly`,
+            body: {
+              workspaceId: workspace.id,
+              userId: session?.user?.id,
+              bitlyGroup,
+              domains,
+              importTags,
+              folderId,
+            },
+          }),
+        ),
+    );
+    return NextResponse.json(response);
+  },
+  {
+    requiredPermissions: ["links.write"],
+  },
+);

@@ -1,146 +1,126 @@
-import { VALID_TINYBIRD_ENDPOINTS, getAnalytics } from "@/lib/analytics";
+import { exportAnalyticsToZip } from "@/lib/analytics/export-analytics-to-zip";
+import {
+  getFirstFilterValue,
+  hasExactlyOneLinkIdFilter,
+} from "@/lib/analytics/filter-helpers";
+import { formatProgramAnalyticsForExport } from "@/lib/analytics/utils/format-analytics-export";
 import { DubApiError } from "@/lib/api/errors";
-import { withAuth } from "@/lib/auth";
-import { getDomainViaEdge } from "@/lib/planetscale";
-import prisma from "@/lib/prisma";
-import { getAnalyticsQuerySchema } from "@/lib/zod/schemas";
-import { linkConstructor } from "@dub/utils";
-import { json2csv } from "json-2-csv";
-import JSZip from "jszip";
+import { getLinkOrThrow } from "@/lib/api/links/get-link-or-throw";
+import { throwIfClicksUsageExceeded } from "@/lib/api/links/usage-checks";
+import { getDefaultProgramIdOrThrow } from "@/lib/api/programs/get-default-program-id-or-throw";
+import { getProgramOrThrow } from "@/lib/api/programs/get-program-or-throw";
+import { assertValidDateRangeForPlan } from "@/lib/api/utils/assert-valid-date-range-for-plan";
+import { prefixWorkspaceId } from "@/lib/api/workspaces/workspace-id";
+import { withWorkspace } from "@/lib/auth";
+import { verifyFolderAccess } from "@/lib/folder/permissions";
+import { getPlanCapabilities } from "@/lib/plan-capabilities";
+import { assertRateLimit } from "@/lib/upstash/assert-rate-limit";
+import { RATELIMIT_POLICIES } from "@/lib/upstash/ratelimit-policies";
+import { parseAnalyticsQuery } from "@/lib/zod/schemas/analytics";
 
-// converts data to CSV
-const convertToCSV = (data: object[]) => {
-  return json2csv(data, {
-    parseValue(fieldValue, defaultParser) {
-      if (fieldValue instanceof Date) {
-        return fieldValue.toISOString();
+export const maxDuration = 300;
+
+// GET /api/analytics/export – get export data for analytics
+export const GET = withWorkspace(
+  async ({ searchParams, workspace, session }) => {
+    await assertRateLimit({
+      policy: RATELIMIT_POLICIES.analyticsExport,
+      identifier: workspace.id,
+    });
+
+    throwIfClicksUsageExceeded(workspace);
+
+    const parsedParams = parseAnalyticsQuery(searchParams);
+
+    let {
+      interval,
+      start,
+      end,
+      folderId,
+      domain,
+      key,
+      linkId,
+      externalId,
+      programId,
+    } = parsedParams;
+
+    let programStartedAt: Date | null | undefined = null;
+    if (programId) {
+      const workspaceProgramId = getDefaultProgramIdOrThrow(workspace);
+      if (programId !== workspaceProgramId) {
+        throw new DubApiError({
+          code: "forbidden",
+          message: `Program ${programId} does not belong to workspace ${prefixWorkspaceId(workspace.id)}.`,
+        });
       }
-      return defaultParser(fieldValue);
-    },
-  });
-};
+      const program = await getProgramOrThrow({
+        workspaceId: workspace.id,
+        programId,
+      });
+      programStartedAt = program.startedAt;
+    }
 
-// GET /api/analytics/[endpoint]/export – get export data for analytics
-export const GET = withAuth(
-  async ({ searchParams, workspace, link }) => {
-    const parsedParams = getAnalyticsQuerySchema.parse(searchParams);
-    const { domain, key, interval } = parsedParams;
+    let folderIdToVerify = getFirstFilterValue(folderId);
+    if (!linkId && (externalId || (domain && key))) {
+      const link = await getLinkOrThrow({
+        workspaceId: workspace.id,
+        linkId,
+        externalId,
+        domain: getFirstFilterValue(domain),
+        key,
+      });
 
-    // return 403 if project is on the free plan and interval is 90d or all
-    if (
-      workspace?.plan === "free" &&
-      (interval === "all" || interval === "90d")
-    ) {
-      throw new DubApiError({
-        code: "forbidden",
-        message: "Require higher plan",
+      parsedParams.linkId = {
+        operator: "IS",
+        sqlOperator: "IN",
+        values: [link.id],
+      };
+
+      parsedParams.domain = undefined;
+
+      if (link.folderId && !folderIdToVerify) {
+        folderIdToVerify = link.folderId;
+      }
+    }
+
+    if (folderIdToVerify) {
+      await verifyFolderAccess({
+        workspace,
+        userId: session.user.id,
+        folderId: folderIdToVerify,
+        requiredPermission: "folders.read",
       });
     }
 
-    const linkId = link
-      ? link.id
-      : domain && key === "_root"
-        ? await getDomainViaEdge(domain).then((d) => d?.id)
-        : null;
+    assertValidDateRangeForPlan({
+      plan: workspace.plan,
+      dataAvailableFrom: workspace.createdAt,
+      interval,
+      start,
+      end,
+    });
 
-    const zip = new JSZip();
+    const { canTrackConversions } = getPlanCapabilities(workspace.plan);
 
-    await Promise.all(
-      VALID_TINYBIRD_ENDPOINTS.map(async (endpoint) => {
-        if (endpoint === "top_links") {
-          // no need to fetch top links data if linkId is defined
-          // since this is just a single link
-          if (linkId) return;
+    const { domain: _domain, key: _key, ...filterParams } = parsedParams;
+    const hasLinkIdFilter = Boolean(parsedParams.linkId);
+    const analyticsParams = hasLinkIdFilter ? filterParams : parsedParams;
 
-          const data = await getAnalytics({
-            workspaceId: workspace.id,
-            endpoint: "top_links",
-            ...parsedParams,
-          });
-
-          const [links, domains] = await Promise.all([
-            prisma.link.findMany({
-              where: {
-                projectId: workspace.id,
-                id: {
-                  in: data.map(({ link }) => link),
-                },
-              },
-              select: {
-                id: true,
-                domain: true,
-                key: true,
-                url: true,
-              },
-            }),
-            prisma.domain.findMany({
-              where: {
-                projectId: workspace.id,
-                id: {
-                  in: data.map(({ link }) => link),
-                },
-              },
-              select: {
-                id: true,
-                slug: true,
-                target: true,
-              },
-            }),
-          ]);
-
-          const allLinks = [
-            ...links.map((link) => ({
-              linkId: link.id,
-              shortLink: linkConstructor({
-                domain: link.domain,
-                key: link.key,
-                pretty: true,
-              }),
-              url: link.url,
-            })),
-            ...domains.map((domain) => ({
-              linkId: domain.id,
-              shortLink: linkConstructor({
-                domain: domain.slug,
-                pretty: true,
-              }),
-              url: domain.target || "",
-            })),
-          ];
-
-          const topLinks = data.map((d) => ({
-            ...allLinks.find((l) => l.linkId === d.link),
-            clicks: d.clicks,
-          }));
-
-          if (!topLinks || topLinks.length === 0) return;
-
-          const csvData = convertToCSV(topLinks);
-
-          zip.file(`${endpoint}.csv`, csvData);
-        } else {
-          // skip clicks endpoint
-          if (endpoint === "clicks") return;
-          // we're not fetching top URLs data if linkId is not defined
-          if (endpoint === "top_urls" && !linkId) return;
-
-          const response = await getAnalytics({
-            workspaceId: workspace.id,
-            ...(linkId && { linkId }),
-            endpoint,
-            ...parsedParams,
-          });
-          if (!response || response.length === 0) return;
-
-          const csvData = convertToCSV(response);
-          zip.file(`${endpoint}.csv`, csvData);
-        }
+    const zipData = await exportAnalyticsToZip({
+      params: analyticsParams,
+      workspaceId: workspace.id,
+      useComposite: canTrackConversions,
+      skipTopLinksForSingleLink: hasExactlyOneLinkIdFilter(parsedParams.linkId),
+      getDataAvailableFrom: (endpoint) =>
+        endpoint === "timeseries"
+          ? programStartedAt ?? workspace.createdAt
+          : undefined,
+      ...(programId && {
+        formatRows: formatProgramAnalyticsForExport,
       }),
-    );
+    });
 
-    const zipData = await zip.generateAsync({ type: "nodebuffer" });
-
-    return new Response(zipData, {
+    return new Response(zipData as unknown as BodyInit, {
       headers: {
         "Content-Type": "application/zip",
         "Content-Disposition": "attachment; filename=analytics_export.zip",
@@ -148,6 +128,6 @@ export const GET = withAuth(
     });
   },
   {
-    needNotExceededClicks: true,
+    requiredPermissions: ["analytics.read"],
   },
 );

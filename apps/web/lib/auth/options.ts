@@ -1,34 +1,118 @@
 import { isBlacklistedEmail } from "@/lib/edge-config";
-import jackson from "@/lib/jackson";
-import prisma from "@/lib/prisma";
+import { jackson } from "@/lib/jackson";
+import { welcomeUserJob } from "@/lib/jobs/handlers/welcome-user-job";
+import { prisma } from "@/lib/prisma";
+import { isStored, storage } from "@/lib/storage";
+import { UserProps } from "@/lib/types";
+import { assertRateLimit } from "@/lib/upstash/assert-rate-limit";
+import { RATELIMIT_POLICIES } from "@/lib/upstash/ratelimit-policies";
+import { sendEmail } from "@dub/email";
+import LoginLink from "@dub/email/templates/login-link";
+import { APP_DOMAIN, PARTNERS_DOMAIN } from "@dub/utils";
 import { PrismaAdapter } from "@next-auth/prisma-adapter";
-import { sendEmail } from "emails";
-import LoginLink from "emails/login-link";
-import WelcomeEmail from "emails/welcome-email";
-import { type NextAuthOptions } from "next-auth";
+import { PrismaClient } from "@prisma/client";
+import { waitUntil } from "@vercel/functions";
+import { User, type NextAuthOptions } from "next-auth";
+import { AdapterAccount, AdapterUser } from "next-auth/adapters";
+import { JWT } from "next-auth/jwt";
 import CredentialsProvider from "next-auth/providers/credentials";
 import EmailProvider from "next-auth/providers/email";
 import GithubProvider from "next-auth/providers/github";
 import GoogleProvider from "next-auth/providers/google";
-import { subscribe } from "../flodesk";
-import { isStored, storage } from "../storage";
+import { headers } from "next/headers";
+import { createId } from "../api/create-id";
+import { isProduction } from "../api/environment";
+import { isSamlEnforcedForEmailDomain } from "../api/workspaces/is-saml-enforced-for-email-domain";
+import { completeProgramApplications } from "../partners/complete-program-applications";
+import {
+  consumeAdminImpersonation,
+  markAdminImpersonation,
+} from "./admin-impersonation";
+import {
+  exceededLoginAttemptsThreshold,
+  incrementLoginAttempts,
+} from "./lock-account";
+import { validatePassword } from "./password";
+import { SSO_LOGIN_PROGRAMS } from "./sso-login-programs";
+import { trackDubLead } from "./track-dub-lead";
 
 const VERCEL_DEPLOYMENT = !!process.env.VERCEL_URL;
+
+const CustomPrismaAdapter = (p: PrismaClient) => {
+  return {
+    ...PrismaAdapter(p),
+    createUser: async (data: any) => {
+      return p.user.create({
+        data: {
+          ...data,
+          id: createId({ prefix: "user_" }),
+          notificationPreferences: {
+            create: {},
+          },
+        },
+      });
+    },
+    // Some IdPs (e.g. Beehiiv) return extra token fields
+    // so we need to only include the fields that are valid columns on Account table
+    linkAccount: (account: AdapterAccount) =>
+      p.account.create({
+        data: {
+          userId: account.userId,
+          type: account.type,
+          provider: account.provider,
+          providerAccountId: account.providerAccountId,
+          refresh_token: account.refresh_token,
+          refresh_token_expires_in: account.refresh_token_expires_in as any,
+          access_token: account.access_token,
+          expires_at: account.expires_at,
+          token_type: account.token_type,
+          scope: account.scope,
+          id_token: account.id_token,
+          session_state: account.session_state,
+        },
+      }),
+    // simplified version of https://github.com/nextauthjs/next-auth/blob/main/packages/adapter-prisma/src/index.ts#L80
+    useVerificationToken: async ({ identifier, token }) => {
+      try {
+        const verificationToken = await p.verificationToken.delete({
+          where: { identifier_token: { identifier, token } },
+        });
+
+        if (verificationToken.isAdminImpersonation) {
+          markAdminImpersonation(identifier);
+        }
+
+        return verificationToken;
+      } catch (error: any) {
+        if (error.code === "P2025") {
+          return null;
+        }
+
+        throw error;
+      }
+    },
+  };
+};
 
 export const authOptions: NextAuthOptions = {
   providers: [
     EmailProvider({
-      sendVerificationRequest({ identifier, url }) {
-        if (process.env.NODE_ENV === "development") {
+      async sendVerificationRequest({ identifier, url }) {
+        await assertRateLimit({
+          policy: RATELIMIT_POLICIES.loginLinkSend,
+          identifier,
+        });
+
+        if (!isProduction) {
           console.log(`Login link: ${url}`);
           return;
-        } else {
-          sendEmail({
-            email: identifier,
-            subject: `Your ${process.env.NEXT_PUBLIC_APP_NAME} Login Link`,
-            react: LoginLink({ url, email: identifier }),
-          });
         }
+
+        sendEmail({
+          to: identifier,
+          subject: "Your Dub Login Link",
+          react: LoginLink({ url, email: identifier }),
+        });
       },
     }),
     GoogleProvider({
@@ -39,6 +123,7 @@ export const authOptions: NextAuthOptions = {
     GithubProvider({
       clientId: process.env.GITHUB_CLIENT_ID as string,
       clientSecret: process.env.GITHUB_CLIENT_SECRET as string,
+      issuer: "https://github.com/login/oauth",
       allowDangerousEmailAccountLinking: true,
     }),
     {
@@ -48,7 +133,7 @@ export const authOptions: NextAuthOptions = {
       version: "2.0",
       checks: ["pkce", "state"],
       authorization: {
-        url: `${process.env.NEXTAUTH_URL}/api/auth/saml/authorize`,
+        url: `${APP_DOMAIN}/api/auth/saml/authorize`,
         params: {
           scope: "",
           response_type: "code",
@@ -56,10 +141,10 @@ export const authOptions: NextAuthOptions = {
         },
       },
       token: {
-        url: `${process.env.NEXTAUTH_URL}/api/auth/saml/token`,
+        url: `${APP_DOMAIN}/api/auth/saml/token`,
         params: { grant_type: "authorization_code" },
       },
-      userinfo: `${process.env.NEXTAUTH_URL}/api/auth/saml/userinfo`,
+      userinfo: `${APP_DOMAIN}/api/auth/saml/userinfo`,
       profile: async (profile) => {
         let existingUser = await prisma.user.findUnique({
           where: { email: profile.email },
@@ -69,10 +154,14 @@ export const authOptions: NextAuthOptions = {
         if (!existingUser) {
           existingUser = await prisma.user.create({
             data: {
+              id: createId({ prefix: "user_" }),
               email: profile.email,
               name: `${profile.firstName || ""} ${
                 profile.lastName || ""
               }`.trim(),
+              notificationPreferences: {
+                create: {},
+              },
             },
           });
         }
@@ -115,7 +204,7 @@ export const authOptions: NextAuthOptions = {
         const { access_token } = await oauthController.token({
           code,
           grant_type: "authorization_code",
-          redirect_uri: process.env.NEXTAUTH_URL as string,
+          redirect_uri: APP_DOMAIN,
           client_id: "dummy",
           client_secret: process.env.NEXTAUTH_SECRET as string,
         });
@@ -139,10 +228,14 @@ export const authOptions: NextAuthOptions = {
         if (!existingUser) {
           existingUser = await prisma.user.create({
             data: {
+              id: createId({ prefix: "user_" }),
               email: userInfo.email,
               name: `${userInfo.firstName || ""} ${
                 userInfo.lastName || ""
               }`.trim(),
+              notificationPreferences: {
+                create: {},
+              },
             },
           });
         }
@@ -160,8 +253,129 @@ export const authOptions: NextAuthOptions = {
         };
       },
     }),
+
+    // Sign in with email and password
+    CredentialsProvider({
+      id: "credentials",
+      name: "Dub.co",
+      type: "credentials",
+      credentials: {
+        email: { type: "email" },
+        password: { type: "password" },
+      },
+      async authorize(credentials, req) {
+        if (!credentials) {
+          throw new Error("no-credentials");
+        }
+
+        const { email, password } = credentials;
+
+        if (!email || !password) {
+          throw new Error("no-credentials");
+        }
+
+        await assertRateLimit({
+          policy: RATELIMIT_POLICIES.login,
+          identifier: email.trim().toLowerCase(),
+        });
+
+        // SSO enforcement check
+        const ssoEnforced = await isSamlEnforcedForEmailDomain(email);
+
+        if (ssoEnforced) {
+          throw new Error("require-saml-sso");
+        }
+
+        const user = await prisma.user.findUnique({
+          where: { email },
+          select: {
+            id: true,
+            passwordHash: true,
+            name: true,
+            email: true,
+            image: true,
+            invalidLoginAttempts: true,
+            emailVerified: true,
+          },
+        });
+
+        if (!user || !user.passwordHash) {
+          throw new Error("invalid-credentials");
+        }
+
+        if (exceededLoginAttemptsThreshold(user)) {
+          throw new Error("exceeded-login-attempts");
+        }
+
+        const passwordMatch = await validatePassword({
+          password,
+          passwordHash: user.passwordHash,
+        });
+
+        if (!passwordMatch) {
+          const exceededLoginAttempts = exceededLoginAttemptsThreshold(
+            await incrementLoginAttempts(user),
+          );
+
+          if (exceededLoginAttempts) {
+            throw new Error("exceeded-login-attempts");
+          } else {
+            throw new Error("invalid-credentials");
+          }
+        }
+
+        if (!user.emailVerified) {
+          throw new Error("email-not-verified");
+        }
+
+        // Reset invalid login attempts
+        await prisma.user.update({
+          where: { id: user.id },
+          data: {
+            invalidLoginAttempts: 0,
+          },
+        });
+
+        return {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          image: user.image,
+        };
+      },
+    }),
+
+    // SSO Login Programs
+    ...SSO_LOGIN_PROGRAMS.map(({ slug, name, oauth, mapProfile }) => ({
+      id: slug,
+      name,
+      type: "oauth" as const,
+      clientId: oauth.clientId,
+      clientSecret: oauth.clientSecret,
+      checks: ["state" as const],
+      authorization: {
+        url: oauth.authorizationUrl,
+        params: {
+          scope: oauth.scope,
+          response_type: "code",
+        },
+      },
+      token: oauth.tokenUrl,
+      userinfo: oauth.userInfoUrl,
+      profile(profile) {
+        if (mapProfile) return mapProfile(profile);
+        const { sub, email, name, picture } = profile;
+        return {
+          id: sub,
+          name,
+          email,
+          image: picture,
+        };
+      },
+    })),
   ],
-  adapter: PrismaAdapter(prisma),
+  // @ts-ignore
+  adapter: CustomPrismaAdapter(prisma),
   session: { strategy: "jwt" },
   cookies: {
     sessionToken: {
@@ -171,22 +385,42 @@ export const authOptions: NextAuthOptions = {
         sameSite: "lax",
         path: "/",
         // When working on localhost, the cookie domain must be omitted entirely (https://stackoverflow.com/a/1188145)
-        domain: VERCEL_DEPLOYMENT
-          ? `.${process.env.NEXT_PUBLIC_APP_DOMAIN}`
-          : undefined,
+        domain: VERCEL_DEPLOYMENT ? ".dub.co" : undefined,
         secure: VERCEL_DEPLOYMENT,
       },
     },
   },
   pages: {
+    signIn: "/login",
     error: "/login",
   },
   callbacks: {
     signIn: async ({ user, account, profile }) => {
-      console.log({ user, account, profile });
       if (!user.email || (await isBlacklistedEmail(user.email))) {
         return false;
       }
+
+      if (user?.lockedAt) {
+        throw new Error("exceeded-login-attempts");
+      }
+
+      const isAdminImpersonation =
+        account?.provider === "email" && consumeAdminImpersonation(user.email);
+
+      // If the user is not using SAML, we need to check if SAML is enforced for the email domain
+      if (
+        !isAdminImpersonation &&
+        account?.provider !== "saml" &&
+        account?.provider !== "saml-idp" &&
+        account?.provider !== "credentials" // for credentials, we do the check in the CredentialsProvider
+      ) {
+        const ssoEnforced = await isSamlEnforcedForEmailDomain(user.email);
+
+        if (ssoEnforced) {
+          throw new Error("require-saml-sso");
+        }
+      }
+
       if (account?.provider === "google" || account?.provider === "github") {
         const userExists = await prisma.user.findUnique({
           where: { email: user.email },
@@ -206,10 +440,10 @@ export const authOptions: NextAuthOptions = {
             (!userExists.image || !isStored(userExists.image)) &&
             profilePic
           ) {
-            const { url } = await storage.upload(
-              `avatars/${userExists.id}`,
-              profilePic,
-            );
+            const { url } = await storage.upload({
+              key: `avatars/${userExists.id}`,
+              body: profilePic,
+            });
             newAvatar = url;
           }
           await prisma.user.update({
@@ -240,19 +474,41 @@ export const authOptions: NextAuthOptions = {
         if (!samlProfile?.requested?.tenant) {
           return false;
         }
+
         const workspace = await prisma.project.findUnique({
           where: {
             id: samlProfile.requested.tenant,
           },
+          select: {
+            id: true,
+            ssoEmailDomain: true,
+          },
         });
+
         if (workspace) {
+          const { ssoEmailDomain } = workspace;
+          const emailDomain = user.email.split("@")[1];
+
+          // ssoEmailDomain should be required for all SAML enabled workspace
+          // this should not happen
+          if (!ssoEmailDomain) {
+            return false;
+          }
+
+          if (
+            emailDomain.toLocaleLowerCase() !==
+            ssoEmailDomain.toLocaleLowerCase()
+          ) {
+            return false;
+          }
+
           await Promise.allSettled([
             // add user to workspace
             prisma.projectUsers.upsert({
               where: {
                 userId_projectId: {
-                  projectId: workspace.id,
                   userId: user.id,
+                  projectId: workspace.id,
                 },
               },
               update: {},
@@ -275,12 +531,33 @@ export const authOptions: NextAuthOptions = {
       }
       return true;
     },
-    jwt: async ({ token, user, trigger }) => {
-      // force log out banned users
-      if (!token.email || (await isBlacklistedEmail(token.email))) {
-        return {};
-      }
+    // baseUrl is NEXTAUTH_URL when it is set (e.g. on localhost), so resolve
+    // against the request's host instead to support redirects on partners
+    redirect: async ({ url, baseUrl }) => {
+      const trustedOrigins = [baseUrl, APP_DOMAIN, PARTNERS_DOMAIN];
+      const host = (await headers()).get("host");
+      const base =
+        trustedOrigins.find((origin) => new URL(origin).host === host) ??
+        baseUrl;
 
+      let resolved: URL;
+      try {
+        resolved = new URL(url, base);
+      } catch {
+        return base;
+      }
+      const { origin, href } = resolved;
+      return trustedOrigins.includes(origin) ? href : base;
+    },
+    jwt: async ({
+      token,
+      user,
+      trigger,
+    }: {
+      token: JWT;
+      user: User | AdapterUser | UserProps;
+      trigger?: "signIn" | "update" | "signUp";
+    }) => {
       if (user) {
         token.user = user;
       }
@@ -288,8 +565,20 @@ export const authOptions: NextAuthOptions = {
       // refresh the user's data if they update their name / email
       if (trigger === "update") {
         const refreshedUser = await prisma.user.findUnique({
-          where: { id: token.sub },
+          where: {
+            id: token.sub,
+          },
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            image: true,
+            isMachine: true,
+            defaultWorkspace: true,
+            defaultPartnerId: true,
+          },
         });
+
         if (refreshedUser) {
           token.user = refreshedUser;
         } else {
@@ -310,51 +599,73 @@ export const authOptions: NextAuthOptions = {
   },
   events: {
     async signIn(message) {
-      if (message.isNewUser) {
-        const email = message.user.email as string;
-        const user = await prisma.user.findUnique({
-          where: { email },
-          select: {
-            name: true,
-            createdAt: true,
-          },
-        });
-        // only send the welcome email if the user was created in the last 10s
-        // (this is a workaround because the `isNewUser` flag is triggered when a user does `dangerousEmailAccountLinking`)
-        if (
-          user?.createdAt &&
-          new Date(user.createdAt).getTime() > Date.now() - 10000 &&
-          process.env.NEXT_PUBLIC_IS_DUB
-        ) {
-          await Promise.allSettled([
-            subscribe({ email, name: user.name || undefined }),
-            sendEmail({
-              subject: "Welcome to Dub.co!",
-              email,
-              react: WelcomeEmail({
-                email,
-                name: user.name || null,
-              }),
-              marketing: true,
-            }),
-          ]);
-        }
+      const email = message.user.email as string;
+      const user = await prisma.user.findUnique({
+        where: { email },
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          image: true,
+          createdAt: true,
+        },
+      });
+      if (!user) {
+        console.log(
+          `User ${message.user.email} not found, skipping welcome workflow...`,
+        );
+        return;
       }
+      // only process new user workflow if the user was created in the last 15s (newly created user)
+      if (
+        user.createdAt &&
+        new Date(user.createdAt).getTime() > Date.now() - 15000
+      ) {
+        console.log(
+          `New user ${user.email} created,  triggering welcome workflow...`,
+        );
+        waitUntil(
+          Promise.allSettled([
+            // track lead if dub_id cookie is present
+            trackDubLead(user),
+            // trigger welcome workflow 45 minutes after the user signed up
+            welcomeUserJob.dispatch(
+              {
+                userId: user.id,
+              },
+              {
+                delay: 45 * 60,
+                label: user.id,
+              },
+            ),
+          ]),
+        );
+      }
+
       // lazily backup user avatar to R2
       const currentImage = message.user.image;
       if (currentImage && !isStored(currentImage)) {
-        const { url } = await storage.upload(
-          `avatars/${message.user.id}`,
-          currentImage,
+        waitUntil(
+          (async () => {
+            const { url } = await storage.upload({
+              key: `avatars/${message.user.id}`,
+              body: currentImage,
+            });
+            await prisma.user.update({
+              where: {
+                id: message.user.id,
+              },
+              data: {
+                image: url,
+              },
+            });
+          })(),
         );
-        await prisma.user.update({
-          where: {
-            id: message.user.id,
-          },
-          data: {
-            image: url,
-          },
-        });
+      }
+
+      // Complete any outstanding program applications
+      if (message.user.email) {
+        waitUntil(completeProgramApplications(message.user.email));
       }
     },
   },

@@ -1,19 +1,22 @@
+import useCurrentFolderId from "@/lib/swr/use-current-folder-id";
 import useWorkspace from "@/lib/swr/use-workspace";
 import { ImportedDomainCountProps } from "@/lib/types";
 import {
+  AnimatedSizeContainer,
   Button,
   InfoTooltip,
   LoadingSpinner,
   Logo,
   Modal,
-  SimpleTooltipContent,
+  SmartDateTimePicker,
   Switch,
   useMediaQuery,
   useRouterStuff,
 } from "@dub/ui";
 import { fetcher, nFormatter } from "@dub/utils";
-import { ArrowRight } from "lucide-react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { ArrowRight, ChevronDown } from "lucide-react";
+import { motion } from "motion/react";
+import { useRouter } from "next/navigation";
 import {
   Dispatch,
   SetStateAction,
@@ -23,7 +26,8 @@ import {
   useState,
 } from "react";
 import { toast } from "sonner";
-import useSWR, { mutate } from "swr";
+import useSWRImmutable from "swr/immutable";
+import { useImportModalParam } from "./use-import-modal-param";
 
 function ImportRebrandlyModal({
   showImportRebrandlyModal,
@@ -33,8 +37,9 @@ function ImportRebrandlyModal({
   setShowImportRebrandlyModal: Dispatch<SetStateAction<boolean>>;
 }) {
   const router = useRouter();
-  const { id, slug } = useWorkspace();
-  const searchParams = useSearchParams();
+  const { id: workspaceId, slug } = useWorkspace();
+
+  const { folderId } = useCurrentFolderId();
 
   const {
     data: { domains, tagsCount } = {
@@ -42,19 +47,16 @@ function ImportRebrandlyModal({
       tagsCount: null,
     },
     isLoading,
-  } = useSWR<{
+    mutate,
+  } = useSWRImmutable<{
     domains: ImportedDomainCountProps[] | null;
     tagsCount: number | null;
   }>(
-    id && showImportRebrandlyModal && `/api/workspaces/${id}/import/rebrandly`,
+    workspaceId &&
+      showImportRebrandlyModal &&
+      `/api/workspaces/${workspaceId}/import/rebrandly`,
     fetcher,
     {
-      revalidateOnFocus: false,
-      revalidateOnMount: false,
-      revalidateOnReconnect: false,
-      refreshWhenOffline: false,
-      refreshWhenHidden: false,
-      refreshInterval: 0,
       onError: (err) => {
         if (err.message !== "No Rebrandly access token found") {
           toast.error(err.message);
@@ -69,17 +71,16 @@ function ImportRebrandlyModal({
     ImportedDomainCountProps[]
   >([]);
   const [importTags, setImportTags] = useState<boolean>(false);
+  const [createdAfter, setCreatedAfter] = useState<Date | null>(null);
+  const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
 
   const [importing, setImporting] = useState(false);
 
   useEffect(() => {
-    if (searchParams?.get("import") === "rebrandly") {
-      mutate(`/api/workspaces/${id}/import/rebrandly`);
-      setShowImportRebrandlyModal(true);
-    } else {
-      setShowImportRebrandlyModal(false);
+    if (showImportRebrandlyModal && domains !== null) {
+      mutate();
     }
-  }, [searchParams]);
+  }, [showImportRebrandlyModal]);
 
   const isSelected = (domain: string) => {
     return selectedDomains.find((d) => d.domain === domain) ? true : false;
@@ -99,36 +100,36 @@ function ImportRebrandlyModal({
         })
       }
     >
-      <div className="flex flex-col items-center justify-center space-y-3 border-b border-gray-200 px-4 py-8 sm:px-16">
+      <div className="flex flex-col items-center justify-center space-y-3 border-b border-neutral-200 px-4 py-8 sm:px-16">
         <div className="flex items-center space-x-3 py-4">
           <img
-            src="/_static/icons/rebrandly.svg"
+            src="https://assets.dub.co/misc/icons/rebrandly.svg"
             alt="Rebrandly logo"
             className="h-12 w-12"
           />
-          <ArrowRight className="h-5 w-5 text-gray-600" />
+          <ArrowRight className="h-5 w-5 text-neutral-600" />
           <Logo />
         </div>
         <h3 className="text-lg font-medium">Import Your Rebrandly Links</h3>
-        <p className="text-center text-sm text-gray-500">
-          Easily import all your existing Rebrandly links into{" "}
-          {process.env.NEXT_PUBLIC_APP_NAME} with just a few clicks.
+        <p className="text-center text-sm text-neutral-500">
+          Easily import all your existing Rebrandly links into Dub with just a
+          few clicks.
         </p>
       </div>
 
-      <div className="flex flex-col space-y-6 bg-gray-50 px-4 py-8 text-left sm:px-16">
-        {isLoading ? (
-          <button className="flex flex-col items-center justify-center space-y-4 bg-none">
+      <div className="flex flex-col space-y-6 bg-neutral-50 px-4 py-8 text-left sm:px-16">
+        {isLoading || !workspaceId ? (
+          <div className="flex flex-col items-center justify-center space-y-4 bg-none">
             <LoadingSpinner />
-            <p className="text-sm text-gray-500">Connecting to Rebrandly</p>
-          </button>
+            <p className="text-sm text-neutral-500">Connecting to Rebrandly</p>
+          </div>
         ) : domains ? (
           <form
             onSubmit={async (e) => {
               e.preventDefault();
               setImporting(true);
               toast.promise(
-                fetch(`/api/workspaces/${id}/import/rebrandly`, {
+                fetch(`/api/workspaces/${workspaceId}/import/rebrandly`, {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/json",
@@ -136,11 +137,17 @@ function ImportRebrandlyModal({
                   body: JSON.stringify({
                     selectedDomains,
                     importTags,
+                    ...(folderId && { folderId }),
+                    ...(createdAfter && {
+                      createdAfter: createdAfter.toISOString(),
+                    }),
                   }),
                 }).then(async (res) => {
                   if (res.ok) {
-                    await mutate(`/api/domains?workspaceId=${id}`);
-                    router.push(`/${slug}`);
+                    await mutate();
+                    router.push(
+                      `/${slug}/links${folderId ? `?folderId=${folderId}` : ""}`,
+                    );
                   } else {
                     setImporting(false);
                     throw new Error();
@@ -157,13 +164,13 @@ function ImportRebrandlyModal({
             className="flex flex-col space-y-4"
           >
             <div className="flex flex-col space-y-2">
-              <p className="text-sm font-medium text-gray-700">Domains</p>
+              <p className="text-sm font-medium text-neutral-700">Domains</p>
               {domains.map(({ id, domain, links }) => (
-                <div className="flex items-center justify-between space-x-2 rounded-md border border-gray-200 bg-white px-4 py-2">
+                <div className="flex items-center justify-between space-x-2 rounded-md border border-neutral-200 bg-white px-4 py-2">
                   <div>
-                    <p className="font-medium text-gray-800">{domain}</p>
+                    <p className="font-medium text-neutral-800">{domain}</p>
                     {links > 0 && (
-                      <p className="text-xs text-gray-500">
+                      <p className="text-xs text-neutral-500">
                         {nFormatter(links)} links found
                       </p>
                     )}
@@ -192,7 +199,7 @@ function ImportRebrandlyModal({
               ))}
               {tagsCount && (
                 <div className="flex items-center justify-between space-x-2 rounded-md py-1 pl-2 pr-4">
-                  <p className="text-xs text-gray-500">
+                  <p className="text-xs text-neutral-500">
                     {tagsCount} tags found. Import all?
                   </p>
                   <Switch
@@ -202,6 +209,39 @@ function ImportRebrandlyModal({
                 </div>
               )}
             </div>
+
+            {/* Advanced Settings */}
+            <div className="flex flex-col border-t border-neutral-200 pt-4">
+              <button
+                type="button"
+                className="flex w-full items-center gap-2"
+                onClick={() => setShowAdvancedOptions(!showAdvancedOptions)}
+              >
+                <p className="text-sm text-neutral-600">
+                  {showAdvancedOptions ? "Hide" : "Show"} advanced settings
+                </p>
+                <motion.div
+                  animate={{ rotate: showAdvancedOptions ? 180 : 0 }}
+                  className="text-neutral-600"
+                >
+                  <ChevronDown className="size-4" />
+                </motion.div>
+              </button>
+
+              <AnimatedSizeContainer height className="flex flex-col">
+                {showAdvancedOptions && (
+                  <div className="mt-4 p-px">
+                    <SmartDateTimePicker
+                      value={createdAfter}
+                      onChange={(date) => setCreatedAfter(date)}
+                      label="Only import links created after"
+                      placeholder="Select date (optional)"
+                    />
+                  </div>
+                )}
+              </AnimatedSizeContainer>
+            </div>
+
             <Button
               text="Confirm import"
               loading={importing}
@@ -214,7 +254,7 @@ function ImportRebrandlyModal({
             onSubmit={async (e) => {
               e.preventDefault();
               setSubmitting(true);
-              fetch(`/api/workspaces/${id}/import/rebrandly`, {
+              fetch(`/api/workspaces/${workspaceId}/import/rebrandly`, {
                 method: "PUT",
                 headers: {
                   "Content-Type": "application/json",
@@ -224,7 +264,7 @@ function ImportRebrandlyModal({
                 }),
               }).then(async (res) => {
                 if (res.ok) {
-                  await mutate(`/api/workspaces/${id}/import/rebrandly`);
+                  await mutate();
                   toast.success("Successfully added API key");
                 } else {
                   toast.error("Error adding API key");
@@ -236,17 +276,11 @@ function ImportRebrandlyModal({
           >
             <div>
               <div className="flex items-center space-x-2">
-                <h2 className="text-sm font-medium text-gray-900">
+                <h2 className="text-sm font-medium text-neutral-900">
                   Rebrandly API Key
                 </h2>
                 <InfoTooltip
-                  content={
-                    <SimpleTooltipContent
-                      title={`Your Rebrandly API Key can be found in your Rebrandly account under`}
-                      cta="Account > API"
-                      href="https://app.rebrandly.com/account/api"
-                    />
-                  }
+                  content={`Your Rebrandly API Key can be found in your Rebrandly account under [Account > API](https://app.rebrandly.com/account/api)`}
                 />
               </div>
               <input
@@ -257,7 +291,7 @@ function ImportRebrandlyModal({
                 placeholder="93467061146a64622df83c12bcc0bffb"
                 autoComplete="off"
                 required
-                className="mt-1 block w-full appearance-none rounded-md border border-gray-300 px-3 py-2 placeholder-gray-400 shadow-sm focus:border-black focus:outline-none focus:ring-black sm:text-sm"
+                className="mt-1 block w-full appearance-none rounded-md border border-neutral-300 px-3 py-2 placeholder-neutral-400 shadow-sm focus:border-black focus:outline-none focus:ring-black sm:text-sm"
               />
             </div>
             <Button text="Confirm API Key" loading={submitting} />
@@ -270,7 +304,7 @@ function ImportRebrandlyModal({
 
 export function useImportRebrandlyModal() {
   const [showImportRebrandlyModal, setShowImportRebrandlyModal] =
-    useState(false);
+    useImportModalParam("rebrandly");
 
   const ImportRebrandlyModalCallback = useCallback(() => {
     return (

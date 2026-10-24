@@ -1,38 +1,11 @@
-import z from "@/lib/zod";
-import { capitalize } from "@dub/utils";
-import { NextResponse } from "next/server";
-import { ZodError } from "zod";
+import { after, NextResponse } from "next/server";
+import "server-only";
 import { generateErrorMessage } from "zod-error";
 import { ZodOpenApiResponseObject } from "zod-openapi";
-import { PlanProps } from "../types";
-
-export const ErrorCode = z.enum([
-  "bad_request",
-  "not_found",
-  "internal_server_error",
-  "unauthorized",
-  "forbidden",
-  "rate_limit_exceeded",
-  "invite_expired",
-  "invite_pending",
-  "exceeded_limit",
-  "conflict",
-  "unprocessable_entity",
-]);
-
-const errorCodeToHttpStatus: Record<z.infer<typeof ErrorCode>, number> = {
-  bad_request: 400,
-  unauthorized: 401,
-  forbidden: 403,
-  exceeded_limit: 403,
-  not_found: 404,
-  conflict: 409,
-  invite_pending: 409,
-  invite_expired: 410,
-  unprocessable_entity: 422,
-  rate_limit_exceeded: 429,
-  internal_server_error: 500,
-};
+import * as z from "zod/v4";
+import { logger } from "../axiom/server";
+import { PartnerProps, WorkspaceProps } from "../types";
+import { ErrorCode, ErrorCodes } from "./error-codes";
 
 const speakeasyErrorOverrides: Record<z.infer<typeof ErrorCode>, string> = {
   bad_request: "BadRequest",
@@ -50,22 +23,22 @@ const speakeasyErrorOverrides: Record<z.infer<typeof ErrorCode>, string> = {
 
 const ErrorSchema = z.object({
   error: z.object({
-    code: ErrorCode.openapi({
+    code: ErrorCode.meta({
       description: "A short code indicating the error code returned.",
       example: "not_found",
     }),
-    message: z.string().openapi({
+    message: z.string().meta({
       description: "A human readable error message.",
       example: "The requested resource was not found.",
     }),
-    doc_url: z.string().optional().openapi({
+    doc_url: z.string().optional().meta({
       description: "A URL to more information about the error code reported.",
       example: "https://dub.co/docs/api-reference",
     }),
   }),
 });
 
-export type ErrorResponse = z.infer<typeof ErrorSchema>;
+type ErrorResponse = z.infer<typeof ErrorSchema>;
 export type ErrorCodes = z.infer<typeof ErrorCode>;
 
 export class DubApiError extends Error {
@@ -83,13 +56,13 @@ export class DubApiError extends Error {
   }) {
     super(message);
     this.code = code;
-    this.docUrl = docUrl ?? `${docErrorUrl}#${code}`;
+    this.docUrl = docUrl ?? `${docErrorUrl}#${code.replace("_", "-")}`;
   }
 }
 
 const docErrorUrl = "https://dub.co/docs/api-reference/errors";
 
-export function fromZodError(error: ZodError): ErrorResponse {
+export function fromZodError(error: z.ZodError): ErrorResponse {
   return {
     error: {
       code: "unprocessable_entity",
@@ -112,17 +85,36 @@ export function fromZodError(error: ZodError): ErrorResponse {
           label: "",
         },
       }),
-      doc_url: `${docErrorUrl}#unprocessable_entity`,
+      doc_url: `${docErrorUrl}#unprocessable-entity`,
     },
   };
 }
 
-export function handleApiError(error: any): ErrorResponse & { status: number } {
+export function handleApiError({
+  error,
+  workspace,
+  partner,
+}: {
+  error: any;
+  workspace?: Pick<WorkspaceProps, "id">;
+  partner?: Pick<PartnerProps, "id">;
+}): ErrorResponse & { status: number } {
+  console.error(error.message);
+
+  // Send error to Axiom
+  logger.error(error.message, {
+    error,
+    ...(workspace?.id ? { workspaceId: workspace.id } : {}),
+    ...(partner?.id ? { partnerId: partner.id } : {}),
+  });
+
+  after(() => logger.flush());
+
   // Zod errors
-  if (error instanceof ZodError) {
+  if (error instanceof z.ZodError) {
     return {
       ...fromZodError(error),
-      status: errorCodeToHttpStatus.unprocessable_entity,
+      status: ErrorCodes.unprocessable_entity,
     };
   }
 
@@ -134,26 +126,43 @@ export function handleApiError(error: any): ErrorResponse & { status: number } {
         message: error.message,
         doc_url: error.docUrl,
       },
-      status: errorCodeToHttpStatus[error.code],
+      status: ErrorCodes[error.code],
+    };
+  }
+
+  // Prisma record not found error
+  if (error.code === "P2025") {
+    return {
+      error: {
+        code: "not_found",
+        message:
+          error?.meta?.cause ||
+          error.message ||
+          "The requested resource was not found.",
+        doc_url: `${docErrorUrl}#not-found`,
+      },
+      status: 404,
     };
   }
 
   // Fallback
+  // Unhandled errors are not user-facing, so we don't expose the actual error
   return {
     error: {
       code: "internal_server_error",
-      message: error instanceof Error ? error.message : "Internal Server Error",
-      doc_url: `${docErrorUrl}#internal_server_error`,
+      message:
+        "An internal server error occurred. Please contact our support if the problem persists.",
+      doc_url: `${docErrorUrl}#internal-server-error`,
     },
     status: 500,
   };
 }
 
-export function handleAndReturnErrorResponse(
-  err: unknown,
-  headers?: Record<string, string>,
-) {
-  const { error, status } = handleApiError(err);
+export function handleAndReturnErrorResponse(err: unknown, headers?: Headers) {
+  const { error, status } = handleApiError({
+    error: err,
+  });
+
   return NextResponse.json<ErrorResponse>({ error }, { headers, status });
 }
 
@@ -180,6 +189,7 @@ export const errorSchemaFactory = (
                   example: code,
                 },
                 message: {
+                  "x-speakeasy-error-message": true,
                   type: "string",
                   description:
                     "A human readable explanation of what went wrong.",
@@ -189,7 +199,7 @@ export const errorSchemaFactory = (
                   type: "string",
                   description:
                     "A link to our documentation with more details about this error code",
-                  example: `${docErrorUrl}#${code}`,
+                  example: `${docErrorUrl}#${code.replace("_", "-")}`,
                 },
               },
               required: ["code", "message"],
@@ -200,20 +210,4 @@ export const errorSchemaFactory = (
       },
     },
   };
-};
-
-export const exceededLimitError = ({
-  plan,
-  limit,
-  type,
-}: {
-  plan: PlanProps;
-  limit: number;
-  type: "clicks" | "links" | "domains" | "tags" | "users";
-}) => {
-  return `You've reached your ${
-    type === "links" ? "monthly" : ""
-  } limit of ${limit} ${
-    limit === 1 ? type.slice(0, -1) : type
-  } on the ${capitalize(plan)} plan. Please upgrade to add more ${type}.`;
 };

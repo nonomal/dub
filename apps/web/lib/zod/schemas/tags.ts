@@ -1,36 +1,89 @@
-import { tagColors } from "@/lib/types";
-import z from "@/lib/zod";
+import { TAG_COLORS } from "@/ui/colors";
+import * as z from "zod/v4";
+import { booleanQuerySchema, getPaginationQuerySchema } from "./misc";
+
+export const TAGS_MAX_PAGE_SIZE = 100;
+
+export const getTagsQuerySchema = z
+  .object({
+    sortBy: z
+      .enum(["name", "createdAt"])
+      .optional()
+      .default("name")
+      .describe("The field to sort the tags by."),
+    sortOrder: z
+      .enum(["asc", "desc"])
+      .optional()
+      .default("asc")
+      .describe("The order to sort the tags by."),
+    search: z
+      .string()
+      .optional()
+      .describe("The search term to filter the tags by."),
+    ids: z
+      .union([z.string(), z.array(z.string())])
+      .transform((v) => (Array.isArray(v) ? v : v.split(",")))
+      .optional()
+      .describe("IDs of tags to filter by."),
+  })
+  .extend(getPaginationQuerySchema({ pageSize: TAGS_MAX_PAGE_SIZE }));
+
+export const getTagsQuerySchemaExtended = getTagsQuerySchema.extend({
+  // Only Dub UI uses the following query parameters
+  includeLinksCount: booleanQuerySchema.default(false),
+});
+
+export const getTagsCountQuerySchema = getTagsQuerySchema.omit({
+  ids: true,
+  page: true,
+  pageSize: true,
+});
+
+// TODO: Remove "pink" after confirming we don't have any pink tags in the database
+const tagColors = [...TAG_COLORS, "pink"] as const;
 
 export const tagColorSchema = z
   .enum(tagColors, {
-    errorMap: (issue, ctx) => {
-      return {
-        message: `Invalid color. Must be one of: ${tagColors.join(", ")}`,
-      };
-    },
+    error: `Invalid color. Must be one of: ${tagColors.join(", ")}`,
   })
   .describe("The color of the tag");
 
-export const createTagBodySchema = z.object({
-  tag: z.string().min(1).describe("The name of the tag to create."),
-  color: tagColorSchema
-    .optional()
-    .describe(
-      `The color of the tag. If not provided, a random color will be used from the list: ${tagColors.join(", ")}.`,
+const tagName = z
+  .string()
+  .trim()
+  .min(1)
+  .max(190)
+  .describe("The name of the tag to create.");
+
+export const createTagBodySchema = z
+  .object({
+    name: tagName,
+    color: tagColorSchema.describe(
+      `The color of the tag. If not provided, a random color will be used from the list: ${TAG_COLORS.join(", ")}.`,
     ),
-});
+    tag: tagName.meta({
+      deprecated: true,
+    }),
+  })
+  .partial()
+  .superRefine((data, ctx) => {
+    if (!data.name && !data.tag) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["name"],
+        message: "Name is required.",
+      });
+    }
+  });
 
-export const updateTagBodySchema = z.object({
-  name: z.string().min(1),
-  color: tagColorSchema.optional(),
-});
+export const updateTagBodySchema = createTagBodySchema;
 
-export const TagSchema = z
+export const LinkTagSchema = z
   .object({
     id: z.string().describe("The unique ID of the tag."),
     name: z.string().describe("The name of the tag."),
     color: tagColorSchema.describe("The color of the tag."),
   })
-  .openapi({
-    title: "Tag",
+  .meta({
+    title: "LinkTag",
   });

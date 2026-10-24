@@ -1,11 +1,19 @@
-import { withAuth } from "@/lib/auth";
-import prisma from "@/lib/prisma";
+import { getDomainOrThrow } from "@/lib/api/domains/get-domain-or-throw";
+import { transformDomain } from "@/lib/api/domains/transform-domain";
+import { withWorkspace } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
 import { NextResponse } from "next/server";
 
 // POST /api/domains/[domain]/primary – set a domain as primary
-export const POST = withAuth(
-  async ({ headers, workspace, domain }) => {
-    const response = await Promise.all([
+export const POST = withWorkspace(
+  async ({ headers, workspace, params }) => {
+    const { slug: domain } = await getDomainOrThrow({
+      workspace,
+      domain: params.domain,
+      dubDomainChecks: true,
+    });
+
+    const [domainRecord] = await Promise.all([
       prisma.domain.update({
         where: {
           slug: domain,
@@ -13,23 +21,29 @@ export const POST = withAuth(
         data: {
           primary: true,
         },
+        include: {
+          registeredDomain: true,
+        },
       }),
+
       // Set all other domains as not primary
       prisma.domain.updateMany({
         where: {
           projectId: workspace.id,
           primary: true,
+          slug: {
+            not: domain,
+          },
         },
         data: {
           primary: false,
         },
       }),
     ]);
-    console.log({ response });
-    return NextResponse.json(response, { headers });
+
+    return NextResponse.json(transformDomain(domainRecord), { headers });
   },
   {
-    domainChecks: true,
-    requiredRole: ["owner"],
+    requiredPermissions: ["domains.write"],
   },
 );

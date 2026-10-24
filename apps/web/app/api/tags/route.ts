@@ -1,73 +1,147 @@
-import { DubApiError, exceededLimitError } from "@/lib/api/errors";
-import { withAuth } from "@/lib/auth";
-import prisma from "@/lib/prisma";
-import { createTagBodySchema } from "@/lib/zod/schemas";
-import { COLORS_LIST, randomBadgeColor } from "@/ui/links/tag-badge";
+import { createId } from "@/lib/api/create-id";
+import { DubApiError } from "@/lib/api/errors";
+import { withWorkspace } from "@/lib/auth";
+import { exceededLimitError } from "@/lib/exceeded-limit-error";
+import { prisma } from "@/lib/prisma";
+import {
+  LinkTagSchema,
+  createTagBodySchema,
+  getTagsQuerySchemaExtended,
+} from "@/lib/zod/schemas/tags";
+import { randomBadgeColor } from "@/ui/links/tag-badge";
 import { NextResponse } from "next/server";
 
 // GET /api/tags - get all tags for a workspace
-export const GET = withAuth(async ({ workspace, headers }) => {
-  const tags = await prisma.tag.findMany({
-    where: {
-      projectId: workspace.id,
-    },
-    select: {
-      id: true,
-      name: true,
-      color: true,
-    },
-    orderBy: {
-      name: "asc",
-    },
-  });
-  return NextResponse.json(tags, { headers });
-});
+export const GET = withWorkspace(
+  async ({ workspace, headers, searchParams }) => {
+    const {
+      search,
+      ids,
+      sortBy,
+      sortOrder,
+      page = 1,
+      pageSize,
+      includeLinksCount,
+    } = getTagsQuerySchemaExtended.parse(searchParams);
 
-// POST /api/workspaces/[idOrSlug]/tags - create a tag for a workspace
-export const POST = withAuth(async ({ req, workspace, headers }) => {
-  const tagsCount = await prisma.tag.count({
-    where: {
+    const tagWhere = {
       projectId: workspace.id,
-    },
-  });
-
-  if (tagsCount >= workspace.tagsLimit) {
-    throw new DubApiError({
-      code: "exceeded_limit",
-      message: exceededLimitError({
-        plan: workspace.plan,
-        limit: workspace.tagsLimit,
-        type: "tags",
+      ...(search && {
+        name: {
+          contains: search,
+        },
       }),
+      ...(ids && {
+        id: {
+          in: ids,
+        },
+      }),
+    };
+
+    const listArgs = {
+      where: tagWhere,
+      select: {
+        id: true,
+        name: true,
+        color: true,
+      },
+      orderBy: {
+        [sortBy]: sortOrder,
+      },
+      take: pageSize,
+      skip: (page - 1) * pageSize,
+    };
+
+    let tags;
+
+    if (includeLinksCount) {
+      const rows = await prisma.tag.findMany(listArgs);
+      const tagIds = rows.map((t) => t.id);
+
+      if (tagIds.length === 0) {
+        tags = [];
+      } else {
+        const countsByTag = await prisma.linkTag.groupBy({
+          by: ["tagId"],
+          where: {
+            tagId: { in: tagIds },
+          },
+          _count: {
+            _all: true,
+          },
+        });
+
+        const countMap = new Map(
+          countsByTag.map((c) => [c.tagId, c._count._all]),
+        );
+
+        tags = rows.map((row) => ({
+          ...row,
+          _count: {
+            links: countMap.get(row.id) ?? 0,
+          },
+        }));
+      }
+    } else {
+      tags = await prisma.tag.findMany(listArgs);
+    }
+
+    return NextResponse.json(tags, { headers });
+  },
+  {
+    requiredPermissions: ["tags.read"],
+  },
+);
+
+// POST /api/tags - create a tag for a workspace
+export const POST = withWorkspace(
+  async ({ req, workspace, headers }) => {
+    const tagsCount = await prisma.tag.count({
+      where: {
+        projectId: workspace.id,
+      },
     });
-  }
 
-  const { tag, color } = createTagBodySchema.parse(await req.json());
+    if (tagsCount >= workspace.tagsLimit) {
+      throw new DubApiError({
+        code: "exceeded_limit",
+        message: exceededLimitError({
+          plan: workspace.plan,
+          planPeriod: workspace.planPeriod,
+          limit: workspace.tagsLimit,
+          type: "tags",
+        }),
+      });
+    }
 
-  const existingTag = await prisma.tag.findFirst({
-    where: {
-      projectId: workspace.id,
-      name: tag,
-    },
-  });
+    const { tag, color, name } = createTagBodySchema.parse(await req.json());
 
-  if (existingTag) {
-    throw new DubApiError({
-      code: "conflict",
-      message: "A tag with that name already exists.",
-    });
-  }
+    try {
+      const createdTag = await prisma.tag.create({
+        data: {
+          id: createId({ prefix: "tag_" }),
+          name: tag || name!,
+          color: color || randomBadgeColor(),
+          projectId: workspace.id,
+        },
+      });
 
-  const response = await prisma.tag.create({
-    data: {
-      name: tag,
-      color:
-        color && COLORS_LIST.map(({ color }) => color).includes(color)
-          ? color
-          : randomBadgeColor(),
-      projectId: workspace.id,
-    },
-  });
+      return NextResponse.json(LinkTagSchema.parse(createdTag), {
+        headers,
+        status: 201,
+      });
+    } catch (error) {
+      if (error.code === "P2002") {
+        throw new DubApiError({
+          code: "conflict",
+          message: "A tag with that name already exists.",
+        });
+      }
 
-  return NextResponse.json(response, { headers, status: 201 });
-});
+      throw error;
+    }
+  },
+  {
+    requiredPermissions: ["tags.write"],
+  },
+);

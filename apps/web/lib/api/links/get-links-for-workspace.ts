@@ -1,51 +1,173 @@
-import prisma from "@/lib/prisma";
-import z from "@/lib/zod";
-import { getLinksQuerySchema } from "@/lib/zod/schemas";
-import { combineTagIds, transformLink } from "./utils";
+import { prisma } from "@/lib/prisma";
+import { getLinksQuerySchemaExtended } from "@/lib/zod/schemas/links";
+import * as z from "zod/v4";
+import { DubApiError } from "../errors";
+import { buildPaginationQuery } from "../pagination";
+import { combineTagIds } from "../tags/combine-tag-ids";
+import { encodeKeyIfCaseSensitive } from "./case-sensitivity";
+import { transformLink } from "./utils";
 
-export async function getLinksForWorkspace({
-  workspaceId,
-  domain,
-  tagId,
-  tagIds,
-  search,
-  sort = "createdAt",
-  page,
-  userId,
-  showArchived,
-  withTags,
-}: z.infer<typeof getLinksQuerySchema> & {
+export interface GetLinksForWorkspaceProps
+  extends z.infer<typeof getLinksQuerySchemaExtended> {
   workspaceId: string;
-}) {
+  folderIds?: string[];
+  startDate?: Date;
+  endDate?: Date;
+}
+
+export async function getLinksForWorkspace(filters: GetLinksForWorkspaceProps) {
+  let {
+    workspaceId,
+    domain,
+    tagId,
+    tagIds,
+    tagNames,
+    search,
+    searchMode,
+    userId,
+    showArchived,
+    withTags,
+    folderId,
+    folderIds,
+    linkIds,
+    includeUser,
+    includeWebhooks,
+    includeDashboard,
+    tenantId,
+    partnerId,
+    startDate,
+    endDate,
+  } = filters;
+
+  const paginationQuery = buildPaginationQuery({
+    ...filters,
+    sortOrder: "desc",
+  });
+
+  // Validate the provided cursor ID
+  const cursorId = filters.startingAfter || filters.endingBefore;
+
+  if (cursorId) {
+    const link = await prisma.link.findUnique({
+      where: {
+        id: cursorId,
+      },
+      select: {
+        id: true,
+        projectId: true,
+      },
+    });
+
+    if (!link || link.projectId !== workspaceId) {
+      throw new DubApiError({
+        code: "unprocessable_entity",
+        message: "Invalid cursor: the provided ID does not exist.",
+      });
+    }
+  }
+
   const combinedTagIds = combineTagIds({ tagId, tagIds });
+
+  if (searchMode === "exact" && search) {
+    try {
+      const url = new URL(search);
+      const domain = url.hostname;
+      const key = url.pathname.slice(1);
+
+      if (key) {
+        const encodedKey = encodeKeyIfCaseSensitive({
+          domain,
+          key,
+        });
+
+        search = search.replace(key, encodedKey);
+      }
+    } catch (e) {}
+  }
 
   const links = await prisma.link.findMany({
     where: {
+      ...(linkIds && { id: { in: linkIds } }),
       projectId: workspaceId,
+      ...(tenantId && { tenantId }),
+      AND: [
+        ...(folderIds
+          ? [
+              {
+                OR: [
+                  {
+                    folderId: {
+                      in: folderIds,
+                    },
+                  },
+                  {
+                    folderId: null,
+                  },
+                ],
+              },
+            ]
+          : [
+              {
+                folderId: folderId || null,
+              },
+            ]),
+        ...(search
+          ? [
+              {
+                ...(searchMode === "fuzzy" && {
+                  OR: [
+                    {
+                      shortLink: { contains: search },
+                    },
+                    {
+                      url: { contains: search },
+                    },
+                  ],
+                }),
+                ...(searchMode === "exact" && {
+                  [search.startsWith("https://") ? "shortLink" : "key"]: {
+                    startsWith: search,
+                  },
+                }),
+              },
+            ]
+          : []),
+      ],
       archived: showArchived ? undefined : false,
       ...(domain && { domain }),
-      ...(search && {
-        OR: [
-          {
-            key: { contains: search },
-          },
-          {
-            url: { contains: search },
-          },
-        ],
-      }),
       ...(withTags && {
         tags: {
           some: {},
         },
       }),
-      ...(combinedTagIds.length > 0 && {
-        tags: { some: { tagId: { in: combinedTagIds } } },
-      }),
+      ...(combinedTagIds && combinedTagIds.length > 0
+        ? {
+            tags: { some: { tagId: { in: combinedTagIds } } },
+          }
+        : tagNames
+          ? {
+              tags: {
+                some: {
+                  tag: {
+                    name: {
+                      in: tagNames,
+                    },
+                  },
+                },
+              },
+            }
+          : {}),
+      ...(partnerId && { partnerId }),
       ...(userId && { userId }),
+      ...(startDate &&
+        endDate && {
+          createdAt: {
+            gte: startDate,
+            lte: endDate,
+          },
+        }),
     },
     include: {
-      user: true,
       tags: {
         include: {
           tag: {
@@ -57,14 +179,11 @@ export async function getLinksForWorkspace({
           },
         },
       },
+      user: includeUser,
+      webhooks: includeWebhooks,
+      dashboard: includeDashboard,
     },
-    orderBy: {
-      [sort]: "desc",
-    },
-    take: 100,
-    ...(page && {
-      skip: (page - 1) * 100,
-    }),
+    ...paginationQuery,
   });
 
   return links.map((link) => transformLink(link));

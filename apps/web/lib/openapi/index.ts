@@ -1,25 +1,39 @@
-import { openApiErrorResponses } from "@/lib/openapi/responses";
-import { LinkSchema, TagSchema, WorkspaceSchema } from "@/lib/zod/schemas";
-import { API_DOMAIN } from "@dub/utils";
-import { ZodOpenApiObject } from "zod-openapi";
-import { analyticsPaths } from "./analytics";
+import { createDocument } from "zod-openapi";
+import { webhookEventSchema } from "../webhook/schemas";
+import { DiscountCodeSchema } from "../zod/schemas/discount";
+import { DomainSchema } from "../zod/schemas/domains";
+import { FolderSchema } from "../zod/schemas/folders";
+import { LinkErrorSchema, LinkSchema } from "../zod/schemas/links";
+import { LinkTagSchema } from "../zod/schemas/tags";
+import { analyticsPath } from "./analytics";
+import { bountiesPaths } from "./bounties";
+import { commissionsPaths } from "./commissions";
+import { customersPaths } from "./customers";
+import { discountCodesPaths } from "./discount-codes";
+import { domainsPaths } from "./domains";
+import { embedTokensPaths } from "./embed-tokens";
+import { eventsPath } from "./events";
+import { foldersPaths } from "./folders";
 import { linksPaths } from "./links";
-import { metatagsPath } from "./metatags";
+import { partnersPaths } from "./partners";
+import { payoutsPaths } from "./payouts";
+import { programApplicationsPaths } from "./program-applications";
 import { qrCodePaths } from "./qr";
+import { openApiErrorResponsesComponents } from "./responses";
 import { tagsPaths } from "./tags";
-import { workspacesPaths } from "./workspaces";
+import { trackPaths } from "./track";
 
-export const openApiObject: ZodOpenApiObject = {
+export const document = createDocument({
   openapi: "3.0.3",
   info: {
-    title: "Dub.co API",
+    title: "Dub API",
     description:
-      "Dub is link management infrastructure for companies to create marketing campaigns, link sharing features, and referral programs.",
+      "Dub is the modern link attribution platform for short links, conversion tracking, and affiliate programs.",
     version: "0.0.1",
     contact: {
-      name: "Dub.co Support",
+      name: "Dub Support",
       email: "support@dub.co",
-      url: "https://dub.co/api",
+      url: "https://dub.co/support",
     },
     license: {
       name: "AGPL-3.0 license",
@@ -28,55 +42,48 @@ export const openApiObject: ZodOpenApiObject = {
   },
   servers: [
     {
-      url: API_DOMAIN,
+      url: "https://api.dub.co",
       description: "Production API",
     },
   ],
   paths: {
     ...linksPaths,
-    ...qrCodePaths,
-    ...analyticsPaths,
-    ...workspacesPaths,
+    ...analyticsPath,
+    ...eventsPath,
     ...tagsPaths,
-    ...metatagsPath,
+    ...foldersPaths,
+    ...domainsPaths,
+    ...trackPaths,
+    ...customersPaths,
+    ...partnersPaths,
+    ...programApplicationsPaths,
+    ...discountCodesPaths,
+    ...commissionsPaths,
+    ...payoutsPaths,
+    ...embedTokensPaths,
+    ...qrCodePaths,
+    ...bountiesPaths,
   },
   components: {
     schemas: {
       LinkSchema,
-      WorkspaceSchema,
-      TagSchema,
+      LinkTagSchema,
+      FolderSchema,
+      DomainSchema,
+      DiscountCodeSchema,
+      webhookEventSchema,
+      LinkErrorSchema,
     },
     securitySchemes: {
       token: {
         type: "http",
         description: "Default authentication mechanism",
         scheme: "bearer",
+        "x-speakeasy-example": "DUB_API_KEY",
       },
     },
     responses: {
-      ...openApiErrorResponses,
+      ...openApiErrorResponsesComponents,
     },
   },
-  "x-speakeasy-globals": {
-    parameters: [
-      {
-        "x-speakeasy-globals-hidden": true,
-        name: "workspaceId",
-        in: "query",
-        required: true,
-        schema: {
-          type: "string",
-        },
-      },
-      {
-        "x-speakeasy-globals-hidden": true,
-        name: "projectSlug",
-        in: "query",
-        deprecated: true,
-        schema: {
-          type: "string",
-        },
-      },
-    ],
-  },
-};
+});

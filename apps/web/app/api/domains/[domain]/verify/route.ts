@@ -1,87 +1,160 @@
+import { getConfigResponse } from "@/lib/api/domains/get-config-response";
+import { getDomainOrThrow } from "@/lib/api/domains/get-domain-or-throw";
+import { getDomainResponse } from "@/lib/api/domains/get-domain-response";
+import { serializeVerificationResponse } from "@/lib/api/domains/serialize-verification-response";
+import { verifyDomainWithRetry } from "@/lib/api/domains/verify-domain";
+import { withWorkspace } from "@/lib/auth";
+import { DEFAULT_DC_SERVICE_SUBDOMAIN } from "@/lib/domain-connect/constants";
 import {
-  getConfigResponse,
-  getDomainResponse,
-  verifyDomain,
-} from "@/lib/api/domains";
-import { withAuth } from "@/lib/auth";
-import prisma from "@/lib/prisma";
+  discoverDomainConnectIfEligible,
+  fetchDomainConnectTemplateVersion,
+} from "@/lib/domain-connect/discover";
+import type { DomainConnectDiscovery } from "@/lib/domain-connect/types";
+import { prisma } from "@/lib/prisma";
 import { DomainVerificationStatusProps } from "@/lib/types";
+import { getApexDomain, getSubdomain } from "@dub/utils";
 import { NextResponse } from "next/server";
 
 export const maxDuration = 30;
 
 // GET /api/domains/[domain]/verify - get domain verification status
-export const GET = withAuth(async ({ domain }) => {
-  let status: DomainVerificationStatusProps = "Valid Configuration";
+export const GET = withWorkspace(
+  async ({ params, workspace }) => {
+    const { slug: domain } = await getDomainOrThrow({
+      workspace,
+      domain: params.domain,
+      dubDomainChecks: true,
+    });
 
-  const [domainJson, configJson] = await Promise.all([
-    getDomainResponse(domain),
-    getConfigResponse(domain),
-  ]);
+    let status: DomainVerificationStatusProps = "Valid Configuration";
+    const apex = getApexDomain(`https://${domain}`);
 
-  if (domainJson?.error?.code === "not_found") {
-    // domain not found on Vercel project
-    status = "Domain Not Found";
-    return NextResponse.json({ status, response: { configJson, domainJson } });
-  } else if (domainJson.error) {
-    status = "Unknown Error";
-    return NextResponse.json({ status, response: { configJson, domainJson } });
-  }
+    const [domainJson, configJson] = await Promise.all([
+      getDomainResponse(domain),
+      getConfigResponse(domain),
+    ]);
 
-  /**
-   * Domain has DNS conflicts
-   */
-  if (configJson?.conflicts.length > 0) {
-    status = "Conflicting DNS Records";
-    return NextResponse.json({ status, response: { configJson, domainJson } });
-  }
+    if (domainJson?.error?.code === "not_found") {
+      // domain not found on Vercel project
+      status = "Domain Not Found";
+      return NextResponse.json({
+        status,
+        response: serializeVerificationResponse({ domainJson, configJson }),
+        domainConnect: null,
+      });
+    } else if (domainJson.error) {
+      status = "Unknown Error";
+      return NextResponse.json({
+        status,
+        response: serializeVerificationResponse({ domainJson, configJson }),
+        domainConnect: null,
+      });
+    }
 
-  /**
-   * If domain is not verified, we try to verify now
-   */
-  if (!domainJson.verified) {
-    status = "Pending Verification";
-    const verificationJson = await verifyDomain(domain);
+    /**
+     * Domain has DNS conflicts
+     */
+    if (configJson?.conflicts && configJson.conflicts.length > 0) {
+      status = "Conflicting DNS Records";
+      return NextResponse.json({
+        status,
+        response: serializeVerificationResponse({ domainJson, configJson }),
+        domainConnect: null,
+      });
+    }
 
-    if (verificationJson && verificationJson.verified) {
-      /**
-       * Domain was just verified
-       */
-      status = "Valid Configuration";
+    /**
+     * If domain is not verified, we try to verify now
+     */
+    if (!domainJson.verified) {
+      status = "Pending Verification";
+      const verificationJson = await verifyDomainWithRetry(domain);
+
+      if (verificationJson?.verified) {
+        // Re-check config after Vercel ownership verification succeeds
+        const freshConfig = await getConfigResponse(domain);
+        if (freshConfig?.conflicts?.length) {
+          status = "Conflicting DNS Records";
+        } else if (freshConfig?.misconfigured) {
+          status = "Invalid Configuration";
+          await prisma.domain.update({
+            where: { slug: domain },
+            data: { verified: false, lastChecked: new Date() },
+          });
+        } else {
+          status = "Valid Configuration";
+          await prisma.domain.update({
+            where: { slug: domain },
+            data: { verified: true, lastChecked: new Date() },
+          });
+        }
+
+        const domainConnect: DomainConnectDiscovery | null =
+          await discoverDomainConnectIfEligible(apex, status);
+
+        return NextResponse.json({
+          status,
+          response: serializeVerificationResponse({
+            domainJson: { ...domainJson, verified: true },
+            configJson: freshConfig,
+          }),
+          domainConnect,
+        });
+      }
+
+      let domainConnect: DomainConnectDiscovery | null =
+        await discoverDomainConnectIfEligible(apex, status);
+
+      // links-subdomain v1 cannot write the ownership TXT at _vercel.<apex>.
+      // Vercel still serves that version, so skip auto-configure until it is v2.
+      if (
+        domainConnect?.providerKind === "vercel" &&
+        domainConnect.urlAPI &&
+        getSubdomain(domain.toLowerCase(), apex)
+      ) {
+        const version = await fetchDomainConnectTemplateVersion(
+          domainConnect.urlAPI,
+          DEFAULT_DC_SERVICE_SUBDOMAIN,
+        );
+        if (version !== undefined && version < 2) domainConnect = null;
+      }
+
+      return NextResponse.json({
+        status,
+        response: serializeVerificationResponse({ domainJson, configJson }),
+        domainConnect,
+      });
+    }
+
+    let domainConnect: DomainConnectDiscovery | null = null;
+    if (!configJson.misconfigured) {
+      await prisma.domain.update({
+        where: {
+          slug: domain,
+        },
+        data: {
+          verified: true,
+          lastChecked: new Date(),
+        },
+      });
+    } else {
+      status = "Invalid Configuration";
+      [, domainConnect] = await Promise.all([
+        prisma.domain.update({
+          where: { slug: domain },
+          data: { verified: false, lastChecked: new Date() },
+        }),
+        discoverDomainConnectIfEligible(apex, "Invalid Configuration"),
+      ]);
     }
 
     return NextResponse.json({
       status,
-      response: { configJson, domainJson, verificationJson },
+      response: serializeVerificationResponse({ domainJson, configJson }),
+      domainConnect,
     });
-  }
-
-  let prismaResponse: any = null;
-  if (!configJson.misconfigured) {
-    prismaResponse = await prisma.domain.update({
-      where: {
-        slug: domain,
-      },
-      data: {
-        verified: true,
-        lastChecked: new Date(),
-      },
-    });
-  } else {
-    status = "Invalid Configuration";
-    prismaResponse = await prisma.domain.update({
-      where: {
-        slug: domain,
-      },
-      data: {
-        verified: false,
-        lastChecked: new Date(),
-      },
-    });
-  }
-
-  return NextResponse.json({
-    status,
-    response: { configJson, domainJson, prismaResponse },
-  });
-});
+  },
+  {
+    requiredPermissions: ["domains.read"],
+  },
+);

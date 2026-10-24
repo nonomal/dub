@@ -1,39 +1,91 @@
 import { cn } from "@dub/utils";
-import { motion } from "framer-motion";
+import { cva, VariantProps } from "class-variance-authority";
+import { LayoutGroup, motion } from "motion/react";
+import Link from "next/link";
+import { Dispatch, ReactNode, SetStateAction, useId } from "react";
+import { ArrowUpRight } from "./icons";
 
-export function TabSelect({
+const tabSelectButtonVariants = cva("p-4 transition-colors duration-75", {
+  variants: {
+    variant: {
+      default:
+        "text-content-subtle data-[selected=true]:text-content-emphasis data-[selected=false]:hover:text-content-default",
+      accent:
+        "text-content-subtle transition-[color,font-weight] data-[selected=true]:text-blue-600 data-[selected=false]:hover:text-content-default data-[selected=true]:font-medium",
+    },
+  },
+  defaultVariants: {
+    variant: "default",
+  },
+});
+
+const tabSelectIndicatorVariants = cva("absolute bottom-0 w-full px-1.5", {
+  variants: {
+    variant: {
+      default: "text-bg-inverted",
+      accent: "text-blue-600",
+    },
+  },
+  defaultVariants: {
+    variant: "default",
+  },
+});
+
+export function TabSelect<T extends string>({
+  variant,
   options,
   selected,
-  selectAction,
-}: {
-  options: string[];
-  selected: string;
-  selectAction: (option: string) => void;
+  onSelect,
+  className,
+}: VariantProps<typeof tabSelectButtonVariants> & {
+  options: { id: T; label: ReactNode; href?: string; target?: string }[];
+  selected: string | null;
+  onSelect?: Dispatch<SetStateAction<T>> | ((id: T) => void);
+  className?: string;
 }) {
+  const layoutGroupId = useId();
+
   return (
-    <div className="relative inline-flex items-center space-x-1">
-      {options.map((option) => (
-        <button
-          key={option}
-          className={cn(
-            "relative z-10 px-3 py-1 text-sm font-medium capitalize",
-            {
-              "transition-all hover:text-gray-500": option !== selected,
-            },
-          )}
-          onClick={() => selectAction(option)}
-        >
-          <p>{option}</p>
-          {option === selected && (
-            <motion.div
-              layoutId={options.join("-")}
-              className="absolute left-0 top-0 h-full w-full rounded-lg border border-gray-200 bg-gray-50"
-              style={{ zIndex: -1 }}
-              transition={{ duration: 0.25 }}
-            />
-          )}
-        </button>
-      ))}
+    <div className={cn("flex text-sm", className)}>
+      <LayoutGroup id={layoutGroupId}>
+        {options.map(({ id, label, href, target }) => {
+          const isSelected = id === selected;
+          const As = href ? Link : "div";
+          return (
+            <As
+              key={id}
+              className="relative"
+              href={href ?? "#"}
+              target={target ?? undefined}
+            >
+              <button
+                type="button"
+                {...(onSelect && !href && { onClick: () => onSelect(id) })}
+                className={cn(
+                  tabSelectButtonVariants({ variant }),
+                  target === "_blank" && "group flex items-center gap-1.5",
+                )}
+                data-selected={isSelected}
+                aria-selected={isSelected}
+              >
+                {label}
+                {target === "_blank" && <ArrowUpRight className="size-2.5" />}
+              </button>
+              {isSelected && (
+                <motion.div
+                  layoutId="indicator"
+                  transition={{
+                    duration: 0.1,
+                  }}
+                  className={tabSelectIndicatorVariants({ variant })}
+                >
+                  <div className="h-0.5 rounded-t-full bg-current" />
+                </motion.div>
+              )}
+            </As>
+          );
+        })}
+      </LayoutGroup>
     </div>
   );
 }
